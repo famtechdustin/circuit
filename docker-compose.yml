@@ -1,0 +1,11 @@
+services:
+  circuit:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      # Circuit project data persists on the host across container rebuilds
+      - ./projects:/app/projects
+    env_file:
+      - .env
+    restart: unless-stopped

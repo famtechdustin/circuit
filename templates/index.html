@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Circuit Design Generator</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+
+<header>
+  <h1>Circuit Design Generator</h1>
+  <span id="project-badge" class="badge"></span>
+</header>
+
+<div class="layout">
+
+  <!-- LEFT PANEL: Project management + file status -->
+  <aside class="panel panel-left">
+    <section>
+      <h2>Projects</h2>
+      <div class="input-row">
+        <input id="new-project-name" type="text" placeholder="New project name…" maxlength="64" />
+        <button onclick="createProject()">Create</button>
+      </div>
+      <ul id="project-list" class="file-list"></ul>
+    </section>
+
+    <section id="file-status" style="display:none">
+      <h2>Files</h2>
+      <div class="file-section">
+        <h3>Datasheets <span class="hint">(PDF → datasheets/)</span></h3>
+        <ul id="datasheet-list" class="file-list"></ul>
+      </div>
+      <div class="file-section">
+        <h3>STEP Files <span class="hint">(→ step_files/)</span></h3>
+        <ul id="step-list" class="file-list"></ul>
+      </div>
+      <button class="btn-secondary" onclick="refreshStatus()">Refresh</button>
+      <button class="btn-danger" onclick="clearHistory()" title="Clear conversation history (keeps circuit)">Reset Conversation</button>
+    </section>
+  </aside>
+
+  <!-- CENTER PANEL: Chat -->
+  <main class="panel panel-center">
+    <div id="chat-thread" class="chat-thread"></div>
+
+    <div id="missing-alert" class="alert alert-warning" style="display:none">
+      <strong>Missing datasheets:</strong>
+      <span id="missing-parts-list"></span><br/>
+      <small>Add the PDF(s) to <code>projects/&lt;name&gt;/datasheets/</code> then re-send your prompt.</small>
+    </div>
+
+    <div class="prompt-area">
+      <textarea
+        id="prompt-input"
+        rows="3"
+        placeholder="Describe your circuit… (Shift+Enter for new line, Enter to send)"
+        disabled
+      ></textarea>
+      <button id="send-btn" onclick="sendPrompt()" disabled>Send</button>
+    </div>
+  </main>
+
+  <!-- RIGHT PANEL: SVG schematic -->
+  <aside class="panel panel-right">
+    <div class="svg-toolbar">
+      <h2>Schematic</h2>
+      <div class="svg-controls">
+        <button onclick="zoomIn()" title="Zoom in">+</button>
+        <button onclick="zoomOut()" title="Zoom out">−</button>
+        <button onclick="zoomReset()" title="Fit">Fit</button>
+        <button onclick="downloadSvg()" title="Download SVG">↓ SVG</button>
+      </div>
+    </div>
+    <div id="svg-container" class="svg-container">
+      <div id="svg-panel" class="svg-panel">
+        <div class="svg-placeholder">No schematic yet.<br/>Create a project and send a prompt.</div>
+      </div>
+    </div>
+  </aside>
+
+</div>
+
+<script>
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+let currentProject = null;
+let svgZoom = 1.0;
+let svgPanX = 0;
+let svgPanY = 0;
+let isPanning = false;
+let panStart = {x: 0, y: 0};
+let svgPanStartX = 0;
+let svgPanStartY = 0;
+
+// ---------------------------------------------------------------------------
+// Startup
+// ---------------------------------------------------------------------------
+document.addEventListener('DOMContentLoaded', () => {
+  loadProjects();
+
+  const input = document.getElementById('prompt-input');
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      sendPrompt();
+    }
+  });
+
+  setupSvgPan();
+});
+
+// ---------------------------------------------------------------------------
+// Project management
+// ---------------------------------------------------------------------------
+async function loadProjects() {
+  const res = await fetch('/projects');
+  if (!res.ok) return;
+  const names = await res.json();
+  const list = document.getElementById('project-list');
+  list.innerHTML = '';
+  names.forEach(name => {
+    const li = document.createElement('li');
+    li.className = 'file-item' + (name === currentProject ? ' active' : '');
+    li.textContent = name;
+    li.onclick = () => selectProject(name);
+    list.appendChild(li);
+  });
+}
+
+async function createProject() {
+  const input = document.getElementById('new-project-name');
+  const name = input.value.trim();
+  if (!name) return;
+
+  const res = await fetch('/projects', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({name}),
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    showMessage('error', data.detail || 'Failed to create project.');
+    return;
+  }
+  input.value = '';
+  await loadProjects();
+  selectProject(name);
+}
+
+async function selectProject(name) {
+  currentProject = name;
+  document.getElementById('project-badge').textContent = name;
+  document.getElementById('file-status').style.display = '';
+  document.getElementById('prompt-input').disabled = false;
+  document.getElementById('send-btn').disabled = false;
+  document.getElementById('chat-thread').innerHTML = '';
+  hideMissingAlert();
+
+  await refreshStatus();
+  await refreshSvg();
+}
+
+async function refreshStatus() {
+  if (!currentProject) return;
+  const res = await fetch(`/status/${currentProject}`);
+  if (!res.ok) return;
+  const data = await res.json();
+
+  renderFileList('datasheet-list', data.datasheets, '.pdf');
+  renderFileList('step-list', data.step_files, '.step');
+}
+
+function renderFileList(listId, items, ext) {
+  const list = document.getElementById(listId);
+  list.innerHTML = '';
+  if (!items.length) {
+    const li = document.createElement('li');
+    li.className = 'file-item empty';
+    li.textContent = 'None';
+    list.appendChild(li);
+    return;
+  }
+  items.forEach(name => {
+    const li = document.createElement('li');
+    li.className = 'file-item present';
+    li.textContent = name + ext;
+    list.appendChild(li);
+  });
+}
+
+async function clearHistory() {
+  if (!currentProject) return;
+  if (!confirm('Clear conversation history for this project? The circuit files will be kept.')) return;
+  await fetch(`/projects/${currentProject}/history`, {method: 'DELETE'});
+  document.getElementById('chat-thread').innerHTML = '';
+  showMessage('info', 'Conversation history cleared.');
+}
+
+// ---------------------------------------------------------------------------
+// Prompt / chat
+// ---------------------------------------------------------------------------
+async function sendPrompt() {
+  if (!currentProject) return;
+  const input = document.getElementById('prompt-input');
+  const prompt = input.value.trim();
+  if (!prompt) return;
+
+  input.value = '';
+  hideMissingAlert();
+  addChatMessage('user', prompt);
+
+  const sendBtn = document.getElementById('send-btn');
+  sendBtn.disabled = true;
+  input.disabled = true;
+  addChatMessage('assistant', '…', 'thinking');
+
+  try {
+    const res = await fetch('/prompt', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({project_name: currentProject, prompt}),
+    });
+    const data = await res.json();
+    removeThinking();
+
+    if (data.status === 'ok') {
+      addChatMessage('assistant', data.message + (data.circuit_context ? `\n\n${data.circuit_context}` : ''));
+      await refreshSvg();
+      await refreshStatus();
+    } else if (data.status === 'missing_datasheets') {
+      addChatMessage('assistant', data.message, 'warning');
+      showMissingAlert(data.missing_parts);
+      await refreshStatus();
+    } else {
+      addChatMessage('assistant', 'Error: ' + data.message, 'error');
+    }
+  } catch (err) {
+    removeThinking();
+    addChatMessage('assistant', 'Network error: ' + err.message, 'error');
+  } finally {
+    sendBtn.disabled = false;
+    input.disabled = false;
+    input.focus();
+  }
+}
+
+function addChatMessage(role, text, extraClass = '') {
+  const thread = document.getElementById('chat-thread');
+  const div = document.createElement('div');
+  div.className = `chat-msg ${role}${extraClass ? ' ' + extraClass : ''}`;
+
+  // Render newlines as line breaks
+  div.innerHTML = escapeHtml(text).replace(/\n/g, '<br/>');
+
+  thread.appendChild(div);
+  thread.scrollTop = thread.scrollHeight;
+}
+
+function removeThinking() {
+  const el = document.querySelector('.chat-msg.thinking');
+  if (el) el.remove();
+}
+
+function showMessage(type, text) {
+  addChatMessage('assistant', text, type);
+}
+
+function showMissingAlert(parts) {
+  const alert = document.getElementById('missing-alert');
+  document.getElementById('missing-parts-list').textContent = parts.join(', ');
+  alert.style.display = '';
+}
+
+function hideMissingAlert() {
+  document.getElementById('missing-alert').style.display = 'none';
+}
+
+function escapeHtml(str) {
+  return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+// ---------------------------------------------------------------------------
+// SVG display
+// ---------------------------------------------------------------------------
+async function refreshSvg() {
+  if (!currentProject) return;
+  const res = await fetch(`/svg/${currentProject}`);
+  if (!res.ok) return;
+  const svgText = await res.text();
+  const panel = document.getElementById('svg-panel');
+  panel.innerHTML = svgText;
+  applyTransform();
+}
+
+function applyTransform() {
+  const panel = document.getElementById('svg-panel');
+  panel.style.transform = `translate(${svgPanX}px, ${svgPanY}px) scale(${svgZoom})`;
+}
+
+function zoomIn() {
+  svgZoom = Math.min(svgZoom * 1.25, 8);
+  applyTransform();
+}
+
+function zoomOut() {
+  svgZoom = Math.max(svgZoom / 1.25, 0.1);
+  applyTransform();
+}
+
+function zoomReset() {
+  svgZoom = 1.0;
+  svgPanX = 0;
+  svgPanY = 0;
+  applyTransform();
+}
+
+async function downloadSvg() {
+  if (!currentProject) return;
+  const res = await fetch(`/svg/${currentProject}`);
+  if (!res.ok) return;
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `${currentProject}_schematic.svg`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+// Pan support
+function setupSvgPan() {
+  const container = document.getElementById('svg-container');
+
+  container.addEventListener('mousedown', (e) => {
+    isPanning = true;
+    panStart = {x: e.clientX, y: e.clientY};
+    svgPanStartX = svgPanX;
+    svgPanStartY = svgPanY;
+    container.style.cursor = 'grabbing';
+  });
+
+  window.addEventListener('mousemove', (e) => {
+    if (!isPanning) return;
+    svgPanX = svgPanStartX + (e.clientX - panStart.x);
+    svgPanY = svgPanStartY + (e.clientY - panStart.y);
+    applyTransform();
+  });
+
+  window.addEventListener('mouseup', () => {
+    isPanning = false;
+    container.style.cursor = 'grab';
+  });
+
+  container.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    const delta = e.deltaY > 0 ? 0.9 : 1.1;
+    svgZoom = Math.min(Math.max(svgZoom * delta, 0.1), 8);
+    applyTransform();
+  }, {passive: false});
+}
+</script>
+</body>
+</html>
