@@ -6,6 +6,7 @@ Nets are drawn as right-angle (Manhattan) wires between pin endpoints.
 Power rails (VCC, GND, etc.) receive standard schematic symbols.
 """
 
+import copy
 import io
 import svgwrite
 from svgwrite import cm, mm
@@ -31,6 +32,9 @@ SEG_TOL = 3.0       # px tolerance for "same axis" overlap check
 LANE_STEP = 14      # px per lane index for the dedicated breakout
 MAX_LANES = 6       # cap: lane distance cycles after this many pins (max extra = 84 px)
 MIN_COMP_H = 90     # minimum rendered component height (3 text zones)
+# Clearance added around each component body when checking for overlaps.
+# Must cover pin stubs (PIN_STUB) + max lane exit (MAX_LANES * LANE_STEP) + routing room.
+COMP_PADDING = PIN_STUB + MAX_LANES * LANE_STEP + 20   # ≈ 118 px
 
 
 def _eff_h(comp: dict) -> float:
@@ -154,8 +158,11 @@ def generate_svg(circuit: dict) -> str:
         for gy in range(0, CANVAS_H, GRID * 5):
             grid_group.add(dwg.circle(center=(gx, gy), r=0.8, fill="#999"))
 
-    components = circuit.get("components", [])
-    nets = circuit.get("nets", [])
+    # Deep-copy so the resolver can adjust positions without mutating circuit.json
+    components = copy.deepcopy(circuit.get("components", []))
+    _resolve_overlaps(components)
+
+    nets        = circuit.get("nets", [])
     power_rails = set(circuit.get("power_rails", []))
 
     # Build pin lookups:
@@ -250,6 +257,65 @@ def generate_svg(circuit: dict) -> str:
     buf = io.StringIO()
     dwg.write(buf)
     return buf.getvalue()
+
+
+def _resolve_overlaps(components: list, max_iter: int = 60) -> None:
+    """
+    Iteratively push overlapping component boxes apart (in-place).
+
+    Each component is treated as a rectangle expanded by COMP_PADDING on all
+    sides to account for pin stubs, lane exits, and routing clearance.
+    On each pass all pairs are checked; overlapping pairs are nudged apart
+    in whichever axis requires the smaller displacement.  Repeats until no
+    pair overlaps or max_iter is reached.
+    """
+    for _ in range(max_iter):
+        any_moved = False
+
+        for i in range(len(components)):
+            for j in range(i + 1, len(components)):
+                ci = components[i]
+                cj = components[j]
+
+                xi = ci["position"]["x"];  yi = ci["position"]["y"]
+                wi = ci["bounding_box"]["width"];  hi = _eff_h(ci)
+                xj = cj["position"]["x"];  yj = cj["position"]["y"]
+                wj = cj["bounding_box"]["width"];  hj = _eff_h(cj)
+
+                # Expanded rects
+                ax1, ay1 = xi - COMP_PADDING,        yi - COMP_PADDING
+                ax2, ay2 = xi + wi + COMP_PADDING,   yi + hi + COMP_PADDING
+                bx1, by1 = xj - COMP_PADDING,        yj - COMP_PADDING
+                bx2, by2 = xj + wj + COMP_PADDING,   yj + hj + COMP_PADDING
+
+                ox = min(ax2, bx2) - max(ax1, bx1)
+                oy = min(ay2, by2) - max(ay1, by1)
+
+                if ox <= 0 or oy <= 0:
+                    continue   # already clear
+
+                # Push in the direction of smaller overlap to minimise movement
+                if ox <= oy:
+                    half = ox / 2 + 1
+                    if (xi + wi / 2) <= (xj + wj / 2):
+                        ci["position"]["x"] -= half
+                        cj["position"]["x"] += half
+                    else:
+                        ci["position"]["x"] += half
+                        cj["position"]["x"] -= half
+                else:
+                    half = oy / 2 + 1
+                    if (yi + hi / 2) <= (yj + hj / 2):
+                        ci["position"]["y"] -= half
+                        cj["position"]["y"] += half
+                    else:
+                        ci["position"]["y"] += half
+                        cj["position"]["y"] -= half
+
+                any_moved = True
+
+        if not any_moved:
+            break
 
 
 def _pin_endpoint(comp: dict, pin: dict) -> tuple[float, float]:
