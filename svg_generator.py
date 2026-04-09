@@ -35,6 +35,15 @@ MIN_COMP_H = 90     # minimum rendered component height (3 text zones)
 # Clearance added around each component body when checking for overlaps.
 # Must cover pin stubs (PIN_STUB) + max lane exit (MAX_LANES * LANE_STEP) + routing room.
 COMP_PADDING = PIN_STUB + MAX_LANES * LANE_STEP + 20   # ≈ 118 px
+RAIL_TOP_START = 35          # Y of topmost VCC-type rail
+RAIL_BOT_START = CANVAS_H - 35  # Y of bottommost GND-type rail
+RAIL_SPACING = 22            # px between stacked rails of same polarity
+
+_GND_NAMES = {"GND", "AGND", "DGND", "PGND", "0V"}
+
+
+def _is_gnd_net(name: str) -> bool:
+    return name.upper() in _GND_NAMES
 
 
 def _eff_h(comp: dict) -> float:
@@ -165,6 +174,19 @@ def generate_svg(circuit: dict) -> str:
     nets        = circuit.get("nets", [])
     power_rails = set(circuit.get("power_rails", []))
 
+    # Classify power rails and assign bus Y positions
+    vcc_nets = sorted(n for n in power_rails if not _is_gnd_net(n))
+    gnd_nets = sorted(n for n in power_rails if _is_gnd_net(n))
+    rail_y: dict[str, float] = {}
+    for i, n in enumerate(vcc_nets):
+        rail_y[n] = RAIL_TOP_START + i * RAIL_SPACING
+    for i, n in enumerate(gnd_nets):
+        rail_y[n] = RAIL_BOT_START - i * RAIL_SPACING
+
+    # Reserve space below VCC rails before components start
+    top_margin = RAIL_TOP_START + max(1, len(vcc_nets)) * RAIL_SPACING + 50
+    _normalize_to_canvas(components, top_margin=top_margin)
+
     # Build pin lookups:
     #   pin_endpoints  — stub tip (the visible pin end)
     #   pin_lane_exits — further out by (pin_idx+1)*LANE_STEP, one unique lane per pin
@@ -212,10 +234,15 @@ def generate_svg(circuit: dict) -> str:
             else WIRE_STROKE
         )
 
-        # Power rails: standard schematic symbols only — no wires between pins
+        # Power rails: horizontal bus + vertical stubs
         if is_power:
-            for tip, _ in conn_pts:
-                _draw_power_symbol(dwg, wire_group, name, tip[0], tip[1])
+            ry = rail_y.get(name)
+            if ry is not None and conn_pts:
+                _draw_power_bus(dwg, wire_group, net_label_group,
+                                registry, conn_pts, name, ry, stroke)
+            else:
+                for tip, _ in conn_pts:
+                    _draw_power_symbol(dwg, wire_group, name, tip[0], tip[1])
             continue
 
         if len(conn_pts) < 2:
@@ -316,6 +343,24 @@ def _resolve_overlaps(components: list, max_iter: int = 60) -> None:
 
         if not any_moved:
             break
+
+
+def _normalize_to_canvas(
+    components: list,
+    top_margin: float,
+    left_margin: float = COMP_PADDING,
+) -> None:
+    """Translate all components so none escape the top or left canvas boundary."""
+    if not components:
+        return
+    min_x = min(c["position"]["x"] - COMP_PADDING for c in components)
+    min_y = min(c["position"]["y"] - COMP_PADDING for c in components)
+    shift_x = max(0.0, left_margin - min_x)
+    shift_y = max(0.0, top_margin - min_y)
+    if shift_x > 0 or shift_y > 0:
+        for c in components:
+            c["position"]["x"] += shift_x
+            c["position"]["y"] += shift_y
 
 
 def _pin_endpoint(comp: dict, pin: dict) -> tuple[float, float]:
@@ -741,6 +786,53 @@ def _draw_net_label(
         fill="#333",
         text_anchor="middle",
     ))
+
+
+def _draw_power_bus(
+    dwg: svgwrite.Drawing,
+    wire_group,
+    net_label_group,
+    registry: "_SegmentRegistry",
+    conn_pts: list,
+    name: str,
+    rail_y: float,
+    stroke: str,
+) -> None:
+    """Horizontal power bus at rail_y with vertical stubs from each pin's lane_exit."""
+    if not conn_pts:
+        return
+    lane_xs = [lane[0] for _, lane in conn_pts]
+    bus_x1 = max(10.0, min(lane_xs) - 30)
+    bus_x2 = min(float(CANVAS_W - 10), max(lane_xs) + 30)
+
+    # Bus line
+    wire_group.add(dwg.line(
+        start=(bus_x1, rail_y), end=(bus_x2, rail_y),
+        stroke=stroke, stroke_width=2.5, stroke_linecap="round",
+    ))
+    registry.register_h(rail_y, bus_x1, bus_x2)
+
+    for tip, lane in conn_pts:
+        lx, ly = lane
+        # Comb breakout: tip → lane_exit
+        if abs(tip[0] - lx) > 1 or abs(tip[1] - ly) > 1:
+            wire_group.add(dwg.line(
+                start=tip, end=lane,
+                stroke=stroke, stroke_width=WIRE_W, stroke_linecap="round",
+            ))
+        # Vertical stub: lane_exit → bus
+        if abs(ly - rail_y) > 1:
+            wire_group.add(dwg.line(
+                start=(lx, ly), end=(lx, rail_y),
+                stroke=stroke, stroke_width=WIRE_W, stroke_linecap="round",
+            ))
+            registry.register_v(lx, ly, rail_y)
+        # Junction dot where stub meets bus
+        wire_group.add(dwg.circle(center=(lx, rail_y), r=3, fill=stroke))
+
+    # Net label centred on bus
+    mid_x = (bus_x1 + bus_x2) / 2
+    _draw_net_label(dwg, net_label_group, name, mid_x, rail_y)
 
 
 def _draw_power_symbol(
