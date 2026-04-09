@@ -38,12 +38,12 @@
         </label>
       </div>
       <div class="file-section">
-        <h3>STEP Files <span class="hint">(→ step_files/)</span></h3>
+        <h3>KiCad Symbols <span class="hint">(.kicad_sym → kicad_symbols/)</span></h3>
         <ul id="step-list" class="file-list"></ul>
         <label class="upload-zone" id="step-drop">
-          <input type="file" accept=".step,.stp" multiple hidden id="step-input"
-                 onchange="uploadFiles('step', this.files)" />
-          <span>+ Add STEP/STP</span>
+          <input type="file" accept=".kicad_sym" multiple hidden id="step-input"
+                 onchange="uploadFiles('symbol', this.files)" />
+          <span>+ Add .kicad_sym</span>
         </label>
       </div>
       <button class="btn-secondary" onclick="refreshStatus()">Refresh</button>
@@ -186,7 +186,7 @@ async function refreshStatus() {
   const data = await res.json();
 
   renderFileList('datasheet-list', data.datasheets, '.pdf', `/files/datasheet/${currentProject}`);
-  renderFileList('step-list', data.step_files, '.step', `/files/step/${currentProject}`);
+  renderFileList('step-list', data.kicad_symbols, '.kicad_sym', `/files/symbol/${currentProject}`);
 }
 
 function renderFileList(listId, items, ext, deleteEndpoint) {

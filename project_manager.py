@@ -3,7 +3,7 @@ project_manager.py — filesystem I/O for circuit design projects.
 
 Each project lives at projects/<name>/ and contains:
   datasheets/       — PDF datasheets (user-placed)
-  step_files/       — STEP 3D model files (user-placed)
+  kicad_symbols/    — KiCad 6+ symbol files (.kicad_sym, user-placed)
   circuit.json      — latest structured circuit state
   circuit_context.md — running circuit description
   recreate_prompt.md — single prompt to reproduce circuit
@@ -22,7 +22,7 @@ class Project:
     name: str
     root: Path
     datasheets_dir: Path
-    step_dir: Path
+    symbols_dir: Path
     circuit_json_path: Path
     context_md_path: Path
     recreate_md_path: Path
@@ -35,7 +35,7 @@ def _make_project(name: str) -> Project:
         name=name,
         root=root,
         datasheets_dir=root / "datasheets",
-        step_dir=root / "step_files",
+        symbols_dir=root / "kicad_symbols",
         circuit_json_path=root / "circuit.json",
         context_md_path=root / "circuit_context.md",
         recreate_md_path=root / "recreate_prompt.md",
@@ -52,7 +52,7 @@ def create_project(name: str) -> Project:
     if project.root.exists():
         raise ValueError(f"Project '{name}' already exists.")
     project.datasheets_dir.mkdir(parents=True, exist_ok=False)
-    project.step_dir.mkdir(parents=True, exist_ok=False)
+    project.symbols_dir.mkdir(parents=True, exist_ok=False)
     return project
 
 
@@ -83,13 +83,13 @@ def list_datasheets(project: Project) -> list[str]:
     )
 
 
-def list_step_files(project: Project) -> list[str]:
-    """Return STEP basenames (without extension) present in step_files/."""
-    if not project.step_dir.exists():
+def list_kicad_symbols(project: Project) -> list[str]:
+    """Return .kicad_sym basenames (without extension) present in kicad_symbols/."""
+    if not project.symbols_dir.exists():
         return []
     return sorted(
-        p.stem for p in project.step_dir.iterdir()
-        if p.suffix.lower() in {".step", ".stp"}
+        p.stem for p in project.symbols_dir.iterdir()
+        if p.suffix.lower() == ".kicad_sym"
     )
 
 

@@ -20,8 +20,8 @@ from pydantic import BaseModel
 
 import circuit_designer
 import datasheet_reader
+import kicad_parser
 import project_manager
-import step_parser
 import svg_generator
 
 load_dotenv()
@@ -55,7 +55,7 @@ class PromptResponse(BaseModel):
 class StatusResponse(BaseModel):
     project_name: str
     datasheets: list[str]
-    step_files: list[str]
+    kicad_symbols: list[str]
     has_circuit: bool
     revision: int
 
@@ -100,7 +100,7 @@ async def get_status(project_name: str):
     return StatusResponse(
         project_name=project.name,
         datasheets=project_manager.list_datasheets(project),
-        step_files=project_manager.list_step_files(project),
+        kicad_symbols=project_manager.list_kicad_symbols(project),
         has_circuit=circuit is not None,
         revision=revision,
     )
@@ -119,12 +119,12 @@ async def process_prompt(req: PromptRequest):
 
     existing_circuit = project_manager.read_circuit_json(project)
 
-    # Collect which STEP bounding boxes are available
-    step_bboxes: dict[str, dict] = {}
-    for stem in project_manager.list_step_files(project):
-        bbox = step_parser.get_bounding_box_for_part(project, stem)
-        if bbox:
-            step_bboxes[stem] = bbox
+    # Load KiCad symbol data for all uploaded .kicad_sym files
+    kicad_data: dict[str, list] = {}
+    for stem in project_manager.list_kicad_symbols(project):
+        symbols = kicad_parser.get_kicad_symbols_for_part(project, stem)
+        if symbols:
+            kicad_data[stem] = symbols
 
     # Gather available datasheet texts for all known parts
     # We send all available datasheets; Claude will use what it needs.
@@ -137,7 +137,7 @@ async def process_prompt(req: PromptRequest):
             project_name=req.project_name,
             user_prompt=req.prompt,
             datasheet_texts=datasheet_texts,
-            step_bboxes=step_bboxes,
+            kicad_symbols=kicad_data,
             existing_circuit=existing_circuit,
         )
     except EnvironmentError as e:
@@ -272,22 +272,25 @@ async def upload_datasheet(project_name: str, files: list[UploadFile] = File(...
     return {"saved": saved}
 
 
-@app.post("/upload/step/{project_name}")
-async def upload_step(project_name: str, files: list[UploadFile] = File(...)):
-    """Accept one or more STEP/STP uploads and save to projects/<name>/step_files/."""
+@app.post("/upload/symbol/{project_name}")
+async def upload_symbol(project_name: str, files: list[UploadFile] = File(...)):
+    """Accept one or more .kicad_sym uploads and save to projects/<name>/kicad_symbols/."""
     try:
         project = project_manager.open_project(project_name)
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
+    # Create directory in case this is a legacy project created before this feature
+    project.symbols_dir.mkdir(parents=True, exist_ok=True)
+
     saved = []
     for upload in files:
         filename = Path(upload.filename).name
-        if Path(filename).suffix.lower() not in {".step", ".stp"}:
-            raise HTTPException(status_code=400, detail=f"'{filename}' is not a STEP/STP file.")
-        dest = project.step_dir / (Path(filename).stem + ".step")
+        if Path(filename).suffix.lower() != ".kicad_sym":
+            raise HTTPException(status_code=400, detail=f"'{filename}' is not a .kicad_sym file.")
+        dest = project.symbols_dir / filename
         dest.write_bytes(await upload.read())
-        saved.append(dest.name)
+        saved.append(filename)
 
     return {"saved": saved}
 
@@ -373,16 +376,16 @@ async def delete_datasheet(project_name: str, filename: str):
     return {"deleted": filename}
 
 
-@app.delete("/files/step/{project_name}/{filename}")
-async def delete_step_file(project_name: str, filename: str):
-    """Delete a specific STEP file."""
+@app.delete("/files/symbol/{project_name}/{filename}")
+async def delete_symbol_file(project_name: str, filename: str):
+    """Delete a specific KiCad symbol file."""
     try:
         project = project_manager.open_project(project_name)
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
-    target = (project.step_dir / filename).resolve()
-    if project.step_dir.resolve() not in target.parents:
+    target = (project.symbols_dir / filename).resolve()
+    if project.symbols_dir.resolve() not in target.parents:
         raise HTTPException(status_code=400, detail="Invalid filename.")
 
     if not target.exists():

@@ -103,12 +103,28 @@ Relevant datasheet text is injected in the user message like this:
 Use pin tables, recommended application circuits, and absolute maximum ratings
 from the datasheet when assigning pin numbers, names, and connections.
 
-## STEP bounding box hints
+## KiCad symbol data
 
-When STEP geometry data is available for a part, it appears in the user message as:
-  [STEP_BBOX: PartName] width=<w>px height=<h>px [/STEP_BBOX]
+When a KiCad symbol file has been uploaded for a component, its pin data appears as:
+  [KICAD_SYMBOL: ComponentName]
+  Pins (N total):
+    Pin 1 (VCC) — power_in
+    Pin 2 (GND) — power_in
+    Pin 3 (IN+) — input
+    Pin 4 (OUT) — output
+    ...
+  Suggested bounding_box: width=Wpx height=Hpx
+  [/KICAD_SYMBOL]
 
-Use these dimensions to override the default bounding_box for that component.
+Use this data to:
+- Assign the EXACT pin numbers and names from the KiCad symbol.
+- Set pin.direction from the KiCad pin type (map directly: power_in→power_in,
+  power_out→power_out, input→input, output→output, bidirectional→bidirectional,
+  passive→passive, no_connect→no_connect, open_collector→open_collector).
+- Use the suggested bounding_box dimensions for that component.
+KiCad pin data takes precedence over defaults for pin assignments.
+Datasheets (if also provided) supply electrical specs, application circuits,
+and support component selection — but do NOT override KiCad pin numbers/names.
 
 ## Missing datasheets
 
@@ -130,7 +146,7 @@ def design_step(
     project_name: str,
     user_prompt: str,
     datasheet_texts: dict[str, str],
-    step_bboxes: dict[str, dict],
+    kicad_symbols: dict[str, list],
     existing_circuit: dict | None,
 ) -> tuple[dict, str, str]:
     """
@@ -146,7 +162,7 @@ def design_step(
     client = anthropic.Anthropic(api_key=api_key)
 
     user_message = _build_user_message(
-        user_prompt, datasheet_texts, step_bboxes, existing_circuit
+        user_prompt, datasheet_texts, kicad_symbols, existing_circuit
     )
 
     history = get_history(project_name)
@@ -174,7 +190,7 @@ def design_step(
 def _build_user_message(
     user_prompt: str,
     datasheet_texts: dict[str, str],
-    step_bboxes: dict[str, dict],
+    kicad_symbols: dict[str, list],
     existing_circuit: dict | None,
 ) -> str:
     parts = [user_prompt.strip()]
@@ -184,12 +200,21 @@ def _build_user_message(
         for name, text in datasheet_texts.items():
             parts.append(f"[DATASHEET: {name}]\n{text}\n[/DATASHEET]")
 
-    if step_bboxes:
-        parts.append("\n## STEP geometry hints\n")
-        for name, bbox in step_bboxes.items():
-            parts.append(
-                f"[STEP_BBOX: {name}] width={bbox['width']}px height={bbox['height']}px [/STEP_BBOX]"
-            )
+    if kicad_symbols:
+        parts.append("\n## KiCad symbol data\n")
+        for _file_stem, symbols in kicad_symbols.items():
+            for sym in symbols:
+                lines = [f"[KICAD_SYMBOL: {sym.name}]"]
+                lines.append(f"Pins ({len(sym.pins)} total):")
+                for pin in sym.pins:
+                    lines.append(f"  Pin {pin.number} ({pin.name}) — {pin.pin_type}")
+                lines.append(
+                    f"Suggested bounding_box: "
+                    f"width={sym.bounding_box['width']}px "
+                    f"height={sym.bounding_box['height']}px"
+                )
+                lines.append("[/KICAD_SYMBOL]")
+                parts.append("\n".join(lines))
 
     if existing_circuit is not None:
         parts.append(
