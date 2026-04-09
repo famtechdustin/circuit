@@ -26,8 +26,9 @@ GND_STROKE = "#222222"
 NET_LABEL_FILL = "#ffffff"
 NET_LABEL_STROKE = "#888888"
 GRID = 10
-WIRE_SPACING = 10   # px to shift bend point when a conflict is detected
+WIRE_SPACING = 12   # px to shift mid-bend when a conflict is detected
 SEG_TOL = 3.0       # px tolerance for "same axis" overlap check
+LANE_STEP = 14      # px per pin-index for the dedicated breakout lane
 
 
 # ---------------------------------------------------------------------------
@@ -150,37 +151,61 @@ def generate_svg(circuit: dict) -> str:
     nets = circuit.get("nets", [])
     power_rails = set(circuit.get("power_rails", []))
 
-    # Build a lookup: (component_id, pin_number) → (x, y) of pin stub tip
-    pin_endpoints: dict[tuple[str, int], tuple[float, float]] = {}
+    # Build pin lookups:
+    #   pin_endpoints  — stub tip (the visible pin end)
+    #   pin_lane_exits — further out by (pin_idx+1)*LANE_STEP, one unique lane per pin
+    pin_endpoints:   dict[tuple, tuple[float, float]] = {}
+    pin_lane_exits:  dict[tuple, tuple[float, float]] = {}
     for comp in components:
-        for pin in comp.get("pins", []):
-            ep = _pin_endpoint(comp, pin)
-            pin_endpoints[(comp["id"], pin["number"])] = ep
+        for pin_idx, pin in enumerate(comp.get("pins", [])):
+            key = (comp["id"], pin["number"])
+            pin_endpoints[key]  = _pin_endpoint(comp, pin)
+            pin_lane_exits[key] = _pin_lane_exit(comp, pin, pin_idx)
 
-    # Draw wires first (behind components)
+    # Pre-register all stub→lane segments so the mid-router avoids them
     registry = _SegmentRegistry()
-    wire_group = dwg.add(dwg.g(id="wires"))
-    net_label_group = dwg.add(dwg.g(id="net-labels"))
-    for net in nets:
-        name = net.get("name", "")
-        connections = net.get("connections", [])
-        is_power = name in power_rails
+    for comp in components:
+        for pin_idx, pin in enumerate(comp.get("pins", [])):
+            key  = (comp["id"], pin["number"])
+            tip  = pin_endpoints[key]
+            lane = pin_lane_exits[key]
+            side = pin.get("side", "left")
+            if side in {"left", "right"}:
+                registry.register_h(tip[1], tip[0], lane[0])
+            else:
+                registry.register_v(tip[0], tip[1], lane[1])
 
-        endpoints = []
+    wire_group     = dwg.add(dwg.g(id="wires"))
+    net_label_group = dwg.add(dwg.g(id="net-labels"))
+
+    for net in nets:
+        name        = net.get("name", "")
+        connections = net.get("connections", [])
+        is_power    = name in power_rails
+
+        # Collect (tip, lane_exit) pairs for each connection
+        conn_pts: list[tuple[tuple, tuple]] = []
         for conn in connections:
             key = (conn.get("component_id", ""), conn.get("pin_number", -1))
-            ep = pin_endpoints.get(key)
-            if ep:
-                endpoints.append(ep)
+            tip  = pin_endpoints.get(key)
+            lane = pin_lane_exits.get(key, tip)
+            if tip:
+                conn_pts.append((tip, lane))
 
-        stroke = POWER_STROKE if is_power and name.upper() not in {"GND", "AGND", "DGND"} \
-            else GND_STROKE if name.upper() in {"GND", "AGND", "DGND"} \
+        stroke = (
+            POWER_STROKE if is_power and name.upper() not in {"GND", "AGND", "DGND"}
+            else GND_STROKE if name.upper() in {"GND", "AGND", "DGND"}
             else WIRE_STROKE
+        )
 
-        # Draw wires between consecutive pairs, avoiding overlaps
-        if len(endpoints) >= 2:
-            for i in range(len(endpoints) - 1):
-                waypoints = registry.route(endpoints[i], endpoints[i + 1])
+        # Draw wires: tip → lane → [conflict-free mid route] → lane → tip
+        if len(conn_pts) >= 2:
+            for i in range(len(conn_pts) - 1):
+                tip1,  lane1 = conn_pts[i]
+                tip2,  lane2 = conn_pts[i + 1]
+                mid = registry.route(lane1, lane2)
+                # Full path includes the unique breakout stubs on each end
+                waypoints = [tip1] + mid + [tip2]
                 wire_group.add(dwg.polyline(
                     points=waypoints,
                     stroke=stroke,
@@ -189,23 +214,20 @@ def generate_svg(circuit: dict) -> str:
                     stroke_linejoin="round",
                     stroke_linecap="round",
                 ))
-            # Junction dots at branching nodes
-            if len(endpoints) > 2:
-                for ep in endpoints[1:-1]:
-                    wire_group.add(dwg.circle(
-                        center=ep, r=3,
-                        fill=stroke,
-                    ))
+            # Junction dots at branching lane points
+            if len(conn_pts) > 2:
+                for _, lane in conn_pts[1:-1]:
+                    wire_group.add(dwg.circle(center=lane, r=3, fill=stroke))
 
-        # Net label near midpoint of first wire segment
-        if len(endpoints) >= 2 and name not in power_rails:
-            mid = _midpoint(endpoints[0], endpoints[1])
-            _draw_net_label(dwg, net_label_group, name, mid[0], mid[1])
+        # Net label at midpoint between first two lane exits
+        if len(conn_pts) >= 2 and name not in power_rails:
+            mid_pt = _midpoint(conn_pts[0][1], conn_pts[1][1])
+            _draw_net_label(dwg, net_label_group, name, mid_pt[0], mid_pt[1])
 
-        # Power symbols at each endpoint for power rails
+        # Power symbols drawn at stub tips
         if name in power_rails:
-            for ep in endpoints:
-                _draw_power_symbol(dwg, wire_group, name, ep[0], ep[1])
+            for tip, _ in conn_pts:
+                _draw_power_symbol(dwg, wire_group, name, tip[0], tip[1])
 
     # Draw components on top of wires
     comp_group = dwg.add(dwg.g(id="components"))
@@ -245,6 +267,32 @@ def _pin_endpoint(comp: dict, pin: dict) -> tuple[float, float]:
         return (x + offset * w, y - PIN_STUB)
     else:  # bottom
         return (x + offset * w, y + h + PIN_STUB)
+
+
+def _pin_lane_exit(comp: dict, pin: dict, pin_idx: int) -> tuple[float, float]:
+    """
+    Return the 'lane exit' point for a pin — the stub tip extended further out
+    by (pin_idx + 1) * LANE_STEP pixels along the pin's axis.
+
+    Each pin gets a unique lane distance so no two wires from the same component
+    share the same breakout segment (comb routing).
+    """
+    x = comp["position"]["x"]
+    y = comp["position"]["y"]
+    w = comp["bounding_box"]["width"]
+    h = comp["bounding_box"]["height"]
+    side   = pin.get("side", "left")
+    offset = float(pin.get("offset", 0.5))
+    extra  = (pin_idx + 1) * LANE_STEP
+
+    if side == "left":
+        return (x - PIN_STUB - extra, y + offset * h)
+    elif side == "right":
+        return (x + w + PIN_STUB + extra, y + offset * h)
+    elif side == "top":
+        return (x + offset * w, y - PIN_STUB - extra)
+    else:  # bottom
+        return (x + offset * w, y + h + PIN_STUB + extra)
 
 
 def _midpoint(
