@@ -86,12 +86,15 @@ The JSON must match this structure exactly:
 - pin.direction must be one of: "input", "output", "bidirectional", "passive",
   "power_in", "power_out", "open_collector", "no_connect"
 - Default bounding_box sizes:
-    resistor/capacitor/diode: {"width": 60, "height": 30}
-    DIP IC: {"width": 100, "height": <pin_count * 10>}
-    QFP/QFN IC: {"width": 120, "height": 120}
-    connector: {"width": 50, "height": <pin_count * 15>}
-    transistor: {"width": 60, "height": 60}
-- Keep positions non-overlapping; space components 80–120 px apart.
+    resistor/capacitor/diode: {"width": 70, "height": 36}
+    DIP IC (≤16 pins): {"width": 120, "height": <pin_count * 12>}
+    DIP IC (>16 pins): {"width": 140, "height": <pin_count * 12>}
+    QFP/QFN IC: {"width": 160, "height": 160}
+    connector: {"width": 70, "height": <pin_count * 18>}
+    transistor: {"width": 70, "height": 70}
+- Canvas is 2000 × 1400 px. Spread components across it generously.
+- Keep positions non-overlapping; space components 220–320 px apart.
+- Start first component no closer than (120, 120) from the top-left.
 - ALWAYS return the COMPLETE circuit JSON on every response — never a partial diff.
 - When updating in response to a follow-up, increment metadata.revision by 1.
 

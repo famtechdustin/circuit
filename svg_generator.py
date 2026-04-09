@@ -10,8 +10,8 @@ import io
 import svgwrite
 from svgwrite import cm, mm
 
-CANVAS_W = 1400
-CANVAS_H = 1000
+CANVAS_W = 2000
+CANVAS_H = 1400
 PIN_STUB = 14       # px: length of pin stub protruding from component body
 FONT_SIZE = 10
 LABEL_FONT = 11
@@ -28,7 +28,8 @@ NET_LABEL_STROKE = "#888888"
 GRID = 10
 WIRE_SPACING = 12   # px to shift mid-bend when a conflict is detected
 SEG_TOL = 3.0       # px tolerance for "same axis" overlap check
-LANE_STEP = 14      # px per pin-index for the dedicated breakout lane
+LANE_STEP = 14      # px per lane index for the dedicated breakout
+MAX_LANES = 6       # cap: lane distance cycles after this many pins (max extra = 84 px)
 
 
 # ---------------------------------------------------------------------------
@@ -175,7 +176,7 @@ def generate_svg(circuit: dict) -> str:
             else:
                 registry.register_v(tip[0], tip[1], lane[1])
 
-    wire_group     = dwg.add(dwg.g(id="wires"))
+    wire_group      = dwg.add(dwg.g(id="wires"))
     net_label_group = dwg.add(dwg.g(id="net-labels"))
 
     for net in nets:
@@ -198,36 +199,31 @@ def generate_svg(circuit: dict) -> str:
             else WIRE_STROKE
         )
 
-        # Draw wires: tip → lane → [conflict-free mid route] → lane → tip
-        if len(conn_pts) >= 2:
-            for i in range(len(conn_pts) - 1):
-                tip1,  lane1 = conn_pts[i]
-                tip2,  lane2 = conn_pts[i + 1]
-                mid = registry.route(lane1, lane2)
-                # Full path includes the unique breakout stubs on each end
-                waypoints = [tip1] + mid + [tip2]
-                wire_group.add(dwg.polyline(
-                    points=waypoints,
-                    stroke=stroke,
-                    stroke_width=WIRE_W,
-                    fill="none",
-                    stroke_linejoin="round",
-                    stroke_linecap="round",
-                ))
-            # Junction dots at branching lane points
-            if len(conn_pts) > 2:
-                for _, lane in conn_pts[1:-1]:
-                    wire_group.add(dwg.circle(center=lane, r=3, fill=stroke))
-
-        # Net label at midpoint between first two lane exits
-        if len(conn_pts) >= 2 and name not in power_rails:
-            mid_pt = _midpoint(conn_pts[0][1], conn_pts[1][1])
-            _draw_net_label(dwg, net_label_group, name, mid_pt[0], mid_pt[1])
-
-        # Power symbols drawn at stub tips
-        if name in power_rails:
+        # Power rails: standard schematic symbols only — no wires between pins
+        if is_power:
             for tip, _ in conn_pts:
                 _draw_power_symbol(dwg, wire_group, name, tip[0], tip[1])
+            continue
+
+        if len(conn_pts) < 2:
+            continue
+
+        if len(conn_pts) == 2:
+            # Two endpoints: single L-shaped route
+            tip1, lane1 = conn_pts[0]
+            tip2, lane2 = conn_pts[1]
+            mid = registry.route(lane1, lane2)
+            wire_group.add(dwg.polyline(
+                points=[tip1] + mid + [tip2],
+                stroke=stroke, stroke_width=WIRE_W, fill="none",
+                stroke_linejoin="round", stroke_linecap="round",
+            ))
+            _draw_net_label(dwg, net_label_group, name,
+                            *_midpoint(lane1, lane2))
+        else:
+            # Three or more endpoints: horizontal trunk with vertical stubs
+            _draw_trunk_net(dwg, wire_group, net_label_group,
+                            registry, conn_pts, stroke, name)
 
     # Draw components on top of wires
     comp_group = dwg.add(dwg.g(id="components"))
@@ -283,7 +279,7 @@ def _pin_lane_exit(comp: dict, pin: dict, pin_idx: int) -> tuple[float, float]:
     h = comp["bounding_box"]["height"]
     side   = pin.get("side", "left")
     offset = float(pin.get("offset", 0.5))
-    extra  = (pin_idx + 1) * LANE_STEP
+    extra  = (pin_idx % MAX_LANES + 1) * LANE_STEP
 
     if side == "left":
         return (x - PIN_STUB - extra, y + offset * h)
@@ -300,6 +296,78 @@ def _midpoint(
     p2: tuple[float, float],
 ) -> tuple[float, float]:
     return ((p1[0] + p2[0]) / 2, (p1[1] + p2[1]) / 2)
+
+
+def _draw_trunk_net(
+    dwg: svgwrite.Drawing,
+    wire_group,
+    net_label_group,
+    registry: "_SegmentRegistry",
+    conn_pts: list,
+    stroke: str,
+    name: str,
+) -> None:
+    """
+    Route a net with 3+ connections via a horizontal trunk line.
+
+    Each pin gets:  tip → lane_exit → vertical stub → horizontal trunk
+    The trunk is a single horizontal line at a conflict-free Y, connecting
+    the leftmost and rightmost vertical stub X positions.
+    This avoids the chain-routing problem (wires doubling back mid-route)
+    and keeps every pin's trace in its own lane.
+    """
+    lanes = [lane for _, lane in conn_pts]
+    x_vals = [lx for lx, _ in lanes]
+    x_min = min(x_vals) - WIRE_SPACING
+    x_max = max(x_vals) + WIRE_SPACING
+
+    # Find a conflict-free horizontal trunk Y near the centroid of lane exits
+    y_centroid = sum(ly for _, ly in lanes) / len(lanes)
+    trunk_y = y_centroid
+    offsets = [0]
+    for k in range(1, 25):
+        offsets += [k * WIRE_SPACING, -k * WIRE_SPACING]
+
+    for off in offsets:
+        ty = y_centroid + off
+        h_clear = not registry._h_conflict(ty, x_min, x_max)
+        v_clear = all(not registry._v_conflict(lx, ly, ty) for lx, ly in lanes)
+        if h_clear and v_clear:
+            trunk_y = ty
+            break
+
+    # Register trunk + all vertical branches
+    registry.register_h(trunk_y, x_min, x_max)
+    for lx, ly in lanes:
+        registry.register_v(lx, ly, trunk_y)
+
+    # Draw the trunk
+    wire_group.add(dwg.line(
+        start=(x_min, trunk_y), end=(x_max, trunk_y),
+        stroke=stroke, stroke_width=WIRE_W, stroke_linecap="round",
+    ))
+
+    # Draw each connection: tip → lane → vertical stub to trunk
+    for tip, lane in conn_pts:
+        lx, ly = lane
+        # Stub extension: tip → lane_exit (unique comb tooth)
+        if abs(tip[0] - lx) > 1 or abs(tip[1] - ly) > 1:
+            wire_group.add(dwg.line(
+                start=tip, end=lane,
+                stroke=stroke, stroke_width=WIRE_W, stroke_linecap="round",
+            ))
+        # Vertical branch: lane_exit → trunk
+        if abs(ly - trunk_y) > 1:
+            wire_group.add(dwg.line(
+                start=(lx, ly), end=(lx, trunk_y),
+                stroke=stroke, stroke_width=WIRE_W, stroke_linecap="round",
+            ))
+        # Junction dot where stub meets trunk
+        wire_group.add(dwg.circle(center=(lx, trunk_y), r=3, fill=stroke))
+
+    # Net label centred on the trunk
+    mid_x = (x_min + x_max) / 2
+    _draw_net_label(dwg, net_label_group, name, mid_x, trunk_y)
 
 
 def _draw_component(dwg: svgwrite.Drawing, group, comp: dict) -> None:
