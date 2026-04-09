@@ -30,6 +30,12 @@ WIRE_SPACING = 12   # px to shift mid-bend when a conflict is detected
 SEG_TOL = 3.0       # px tolerance for "same axis" overlap check
 LANE_STEP = 14      # px per lane index for the dedicated breakout
 MAX_LANES = 6       # cap: lane distance cycles after this many pins (max extra = 84 px)
+MIN_COMP_H = 90     # minimum rendered component height (3 text zones)
+
+
+def _eff_h(comp: dict) -> float:
+    """Effective component height — enforces MIN_COMP_H regardless of JSON value."""
+    return max(float(comp["bounding_box"]["height"]), MIN_COMP_H)
 
 
 # ---------------------------------------------------------------------------
@@ -251,7 +257,7 @@ def _pin_endpoint(comp: dict, pin: dict) -> tuple[float, float]:
     x = comp["position"]["x"]
     y = comp["position"]["y"]
     w = comp["bounding_box"]["width"]
-    h = comp["bounding_box"]["height"]
+    h = _eff_h(comp)
     side = pin.get("side", "left")
     offset = float(pin.get("offset", 0.5))
 
@@ -276,7 +282,7 @@ def _pin_lane_exit(comp: dict, pin: dict, pin_idx: int) -> tuple[float, float]:
     x = comp["position"]["x"]
     y = comp["position"]["y"]
     w = comp["bounding_box"]["width"]
-    h = comp["bounding_box"]["height"]
+    h = _eff_h(comp)
     side   = pin.get("side", "left")
     offset = float(pin.get("offset", 0.5))
     extra  = (pin_idx % MAX_LANES + 1) * LANE_STEP
@@ -374,63 +380,212 @@ def _draw_component(dwg: svgwrite.Drawing, group, comp: dict) -> None:
     x = comp["position"]["x"]
     y = comp["position"]["y"]
     w = comp["bounding_box"]["width"]
-    h = comp["bounding_box"]["height"]
-    cid = comp.get("id", "?")
-    name = comp.get("name", "")
-    value = comp.get("value", "")
+    h = _eff_h(comp)
+    cid       = comp.get("id", "?")
+    name      = comp.get("name", "") or comp.get("type", "")
+    value     = comp.get("value", "")
     comp_type = comp.get("type", "").lower()
 
-    # Component body
+    # ── Body ──────────────────────────────────────────────────────────────
     group.add(dwg.rect(
-        insert=(x, y),
-        size=(w, h),
-        fill=COMP_FILL,
-        stroke=COMP_STROKE,
-        stroke_width=COMP_STROKE_W,
+        insert=(x, y), size=(w, h),
+        fill=COMP_FILL, stroke=COMP_STROKE, stroke_width=COMP_STROKE_W,
         rx=3, ry=3,
     ))
 
-    # Component ID (bold, top-left area)
+    cx = x + w / 2          # horizontal centre of box
+
+    # ── Zone layout (3 equal horizontal bands) ────────────────────────────
+    zone = h / 3
+
+    # Zone 1 — Ref Des (top band, centred)
     group.add(dwg.text(
         cid,
-        insert=(x + 4, y + LABEL_FONT + 2),
+        insert=(cx, y + zone * 0.55),
         font_size=LABEL_FONT,
         font_family="monospace",
         font_weight="bold",
         fill="#222",
+        text_anchor="middle",
+        dominant_baseline="middle",
     ))
 
-    # Component name (smaller, below ID)
-    if name:
-        group.add(dwg.text(
-            name,
-            insert=(x + 4, y + LABEL_FONT * 2 + 4),
-            font_size=FONT_SIZE,
-            font_family="monospace",
-            fill="#444",
-        ))
+    # Zone 2 — KiCad-style schematic symbol (middle band)
+    _draw_comp_symbol(dwg, group, comp_type, cx, y + zone * 1.5, w, zone)
 
-    # Value (italic, bottom of body)
+    # Zone 3 — Name then value (bottom band, centred)
+    line_h = FONT_SIZE + 2
+    n_lines = 2 if value else 1
+    y_start = y + zone * 2 + (zone - n_lines * line_h) / 2 + FONT_SIZE
+
+    group.add(dwg.text(
+        name,
+        insert=(cx, y_start),
+        font_size=FONT_SIZE,
+        font_family="monospace",
+        fill="#444",
+        text_anchor="middle",
+    ))
     if value:
         group.add(dwg.text(
             value,
-            insert=(x + 4, y + h - 4),
-            font_size=FONT_SIZE,
+            insert=(cx, y_start + line_h),
+            font_size=FONT_SIZE - 1,
             font_family="monospace",
             font_style="italic",
             fill="#666",
+            text_anchor="middle",
         ))
 
-    # Pin stubs and pin labels
+    # ── Divider lines between zones ────────────────────────────────────────
+    for frac in (1/3, 2/3):
+        group.add(dwg.line(
+            start=(x + 2, y + h * frac), end=(x + w - 2, y + h * frac),
+            stroke=COMP_STROKE, stroke_width=0.4, stroke_dasharray="3,3",
+            opacity="0.4",
+        ))
+
+    # ── Pin stubs ──────────────────────────────────────────────────────────
     for pin in comp.get("pins", []):
         _draw_pin_stub(dwg, group, comp, pin)
+
+
+# ---------------------------------------------------------------------------
+# Component symbol graphics (drawn inside Zone 2)
+# ---------------------------------------------------------------------------
+
+def _draw_comp_symbol(
+    dwg: svgwrite.Drawing, group, comp_type: str,
+    cx: float, cy: float, box_w: float, zone_h: float,
+) -> None:
+    """Dispatch to a type-specific schematic symbol centred at (cx, cy)."""
+    s = min(box_w * 0.35, zone_h * 0.65, 28)   # symbol scale
+    t = comp_type.lower()
+
+    if "resistor" in t:
+        _sym_resistor(dwg, group, cx, cy, s)
+    elif "capacitor" in t or t in {"cap", "bypass"}:
+        _sym_capacitor(dwg, group, cx, cy, s)
+    elif "inductor" in t or "coil" in t or "ferrite" in t:
+        _sym_inductor(dwg, group, cx, cy, s)
+    elif any(x in t for x in ["led", "diode", "schottky", "zener", "tvs"]):
+        _sym_diode(dwg, group, cx, cy, s)
+    elif any(x in t for x in ["transistor", "mosfet", "bjt", "npn", "pnp", "fet"]):
+        _sym_transistor(dwg, group, cx, cy, s)
+    elif any(x in t for x in ["crystal", "xtal", "resonator"]):
+        _sym_crystal(dwg, group, cx, cy, s)
+    elif any(x in t for x in ["connector", "header", "jack", "plug", "socket", "usb"]):
+        _sym_connector(dwg, group, cx, cy, s)
+    else:
+        _sym_ic(dwg, group, cx, cy, s)
+
+
+def _sym_resistor(dwg, group, cx, cy, s):
+    """IEC rectangle resistor symbol."""
+    rw, rh = s * 1.6, s * 0.7
+    group.add(dwg.rect(
+        insert=(cx - rw / 2, cy - rh / 2), size=(rw, rh),
+        fill="none", stroke=COMP_STROKE, stroke_width=1.5,
+    ))
+
+
+def _sym_capacitor(dwg, group, cx, cy, s):
+    """Two parallel plates."""
+    hw  = s * 0.9
+    gap = max(5, s * 0.4)
+    for dy in (-gap / 2, gap / 2):
+        group.add(dwg.line(
+            start=(cx - hw, cy + dy), end=(cx + hw, cy + dy),
+            stroke=COMP_STROKE, stroke_width=2, stroke_linecap="round",
+        ))
+
+
+def _sym_inductor(dwg, group, cx, cy, s):
+    """Three arcs."""
+    r  = s * 0.35
+    n  = 3
+    x0 = cx - r * n
+    for i in range(n):
+        ax = x0 + (2 * i + 1) * r
+        group.add(dwg.path(
+            d=f"M {ax-r:.1f} {cy:.1f} A {r:.1f} {r:.1f} 0 0 1 {ax+r:.1f} {cy:.1f}",
+            fill="none", stroke=COMP_STROKE, stroke_width=1.5,
+        ))
+
+
+def _sym_diode(dwg, group, cx, cy, s):
+    """Triangle + cathode bar."""
+    h = s * 0.9
+    group.add(dwg.polygon(
+        points=[(cx - s, cy - h / 2), (cx - s, cy + h / 2), (cx + s * 0.5, cy)],
+        fill=COMP_STROKE, stroke=COMP_STROKE, stroke_width=1,
+    ))
+    group.add(dwg.line(
+        start=(cx + s * 0.5, cy - h / 2), end=(cx + s * 0.5, cy + h / 2),
+        stroke=COMP_STROKE, stroke_width=2,
+    ))
+
+
+def _sym_transistor(dwg, group, cx, cy, s):
+    """Simplified transistor (collector/base/emitter lines)."""
+    group.add(dwg.line(         # vertical base
+        start=(cx - s * 0.3, cy - s), end=(cx - s * 0.3, cy + s),
+        stroke=COMP_STROKE, stroke_width=2,
+    ))
+    group.add(dwg.line(         # base stub
+        start=(cx - s, cy), end=(cx - s * 0.3, cy),
+        stroke=COMP_STROKE, stroke_width=1.5,
+    ))
+    group.add(dwg.line(         # collector (diagonal up)
+        start=(cx - s * 0.3, cy - s * 0.5), end=(cx + s, cy - s),
+        stroke=COMP_STROKE, stroke_width=1.5,
+    ))
+    group.add(dwg.line(         # emitter (diagonal down with arrow)
+        start=(cx - s * 0.3, cy + s * 0.5), end=(cx + s, cy + s),
+        stroke=COMP_STROKE, stroke_width=1.5,
+    ))
+
+
+def _sym_crystal(dwg, group, cx, cy, s):
+    """Rectangle with lines extending top and bottom."""
+    rw, rh = s * 0.5, s * 1.2
+    group.add(dwg.rect(
+        insert=(cx - rw / 2, cy - rh / 2), size=(rw, rh),
+        fill=COMP_FILL, stroke=COMP_STROKE, stroke_width=1.5,
+    ))
+    for dy in (-rh / 2, rh / 2):
+        group.add(dwg.line(
+            start=(cx - s * 0.8, cy + dy), end=(cx + s * 0.8, cy + dy),
+            stroke=COMP_STROKE, stroke_width=1.5,
+        ))
+
+
+def _sym_connector(dwg, group, cx, cy, s):
+    """Three horizontal contact lines."""
+    spacing = s * 0.55
+    hw = s * 0.75
+    for i in range(3):
+        yy = cy + (i - 1) * spacing
+        group.add(dwg.line(
+            start=(cx - hw, yy), end=(cx + hw, yy),
+            stroke=COMP_STROKE, stroke_width=1.5, stroke_linecap="round",
+        ))
+
+
+def _sym_ic(dwg, group, cx, cy, s):
+    """Generic IC: dashed inner rectangle."""
+    group.add(dwg.rect(
+        insert=(cx - s, cy - s * 0.7), size=(s * 2, s * 1.4),
+        fill="none", stroke=COMP_STROKE, stroke_width=1,
+        stroke_dasharray="4,3",
+    ))
 
 
 def _draw_pin_stub(dwg: svgwrite.Drawing, group, comp: dict, pin: dict) -> None:
     x = comp["position"]["x"]
     y = comp["position"]["y"]
     w = comp["bounding_box"]["width"]
-    h = comp["bounding_box"]["height"]
+    h = _eff_h(comp)
     side = pin.get("side", "left")
     offset = float(pin.get("offset", 0.5))
     pin_name = pin.get("name", "")
