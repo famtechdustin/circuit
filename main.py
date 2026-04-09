@@ -12,8 +12,8 @@ import os
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
@@ -247,3 +247,146 @@ async def clear_history(project_name: str):
     """Clear the in-memory conversation history for a project."""
     circuit_designer.clear_history(project_name)
     return {"cleared": True, "project": project_name}
+
+
+# ---------------------------------------------------------------------------
+# Upload routes
+# ---------------------------------------------------------------------------
+
+@app.post("/upload/datasheet/{project_name}")
+async def upload_datasheet(project_name: str, files: list[UploadFile] = File(...)):
+    """Accept one or more PDF uploads and save to projects/<name>/datasheets/."""
+    try:
+        project = project_manager.open_project(project_name)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    saved = []
+    for upload in files:
+        filename = Path(upload.filename).name
+        if not filename.lower().endswith(".pdf"):
+            raise HTTPException(status_code=400, detail=f"'{filename}' is not a PDF.")
+        (project.datasheets_dir / filename).write_bytes(await upload.read())
+        saved.append(filename)
+
+    return {"saved": saved}
+
+
+@app.post("/upload/step/{project_name}")
+async def upload_step(project_name: str, files: list[UploadFile] = File(...)):
+    """Accept one or more STEP/STP uploads and save to projects/<name>/step_files/."""
+    try:
+        project = project_manager.open_project(project_name)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    saved = []
+    for upload in files:
+        filename = Path(upload.filename).name
+        if Path(filename).suffix.lower() not in {".step", ".stp"}:
+            raise HTTPException(status_code=400, detail=f"'{filename}' is not a STEP/STP file.")
+        dest = project.step_dir / (Path(filename).stem + ".step")
+        dest.write_bytes(await upload.read())
+        saved.append(dest.name)
+
+    return {"saved": saved}
+
+
+# ---------------------------------------------------------------------------
+# Download routes
+# ---------------------------------------------------------------------------
+
+@app.get("/download/context/{project_name}")
+async def download_context(project_name: str):
+    """Serve circuit_context.md as a downloadable attachment."""
+    try:
+        project = project_manager.open_project(project_name)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    if not project.context_md_path.exists():
+        raise HTTPException(status_code=404, detail="No circuit context generated yet.")
+
+    return FileResponse(
+        path=project.context_md_path,
+        media_type="text/markdown",
+        filename=f"{project_name}_circuit_context.md",
+    )
+
+
+@app.get("/download/recreate/{project_name}")
+async def download_recreate(project_name: str):
+    """Serve recreate_prompt.md as a downloadable attachment."""
+    try:
+        project = project_manager.open_project(project_name)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    if not project.recreate_md_path.exists():
+        raise HTTPException(status_code=404, detail="No recreate prompt generated yet.")
+
+    return FileResponse(
+        path=project.recreate_md_path,
+        media_type="text/markdown",
+        filename=f"{project_name}_recreate_prompt.md",
+    )
+
+
+@app.get("/download/circuit/{project_name}")
+async def download_circuit_file(project_name: str):
+    """Serve circuit.json as a downloadable attachment."""
+    try:
+        project = project_manager.open_project(project_name)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    if not project.circuit_json_path.exists():
+        raise HTTPException(status_code=404, detail="No circuit designed yet.")
+
+    return FileResponse(
+        path=project.circuit_json_path,
+        media_type="application/json",
+        filename=f"{project_name}_circuit.json",
+    )
+
+
+# ---------------------------------------------------------------------------
+# File deletion routes
+# ---------------------------------------------------------------------------
+
+@app.delete("/files/datasheet/{project_name}/{filename}")
+async def delete_datasheet(project_name: str, filename: str):
+    """Delete a specific datasheet PDF."""
+    try:
+        project = project_manager.open_project(project_name)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    target = (project.datasheets_dir / filename).resolve()
+    if project.datasheets_dir.resolve() not in target.parents:
+        raise HTTPException(status_code=400, detail="Invalid filename.")
+
+    if not target.exists():
+        raise HTTPException(status_code=404, detail=f"'{filename}' not found.")
+
+    target.unlink()
+    return {"deleted": filename}
+
+
+@app.delete("/files/step/{project_name}/{filename}")
+async def delete_step_file(project_name: str, filename: str):
+    """Delete a specific STEP file."""
+    try:
+        project = project_manager.open_project(project_name)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    target = (project.step_dir / filename).resolve()
+    if project.step_dir.resolve() not in target.parents:
+        raise HTTPException(status_code=400, detail="Invalid filename.")
+
+    if not target.exists():
+        raise HTTPException(status_code=404, detail=f"'{filename}' not found.")
+
+    target.unlink()
+    return {"deleted": filename}

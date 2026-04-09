@@ -392,3 +392,44 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
 ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+
+/* ------------------------------------------------------------------ */
+/* Upload zones                                                          */
+/* ------------------------------------------------------------------ */
+.upload-zone {
+  display: block;
+  margin-top: 4px;
+  padding: 7px 10px;
+  border: 1.5px dashed var(--border);
+  border-radius: 6px;
+  text-align: center;
+  font-size: 11px;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+.upload-zone:hover,
+.upload-zone.dragover {
+  border-color: var(--accent);
+  background: #eff6ff;
+  color: var(--accent);
+}
+
+/* ------------------------------------------------------------------ */
+/* Download bar (right panel, below SVG toolbar)                        */
+/* ------------------------------------------------------------------ */
+.download-bar {
+  display: flex;
+  gap: 4px;
+  padding: 6px 14px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+.btn-dl {
+  padding: 3px 9px;
+  font-size: 11px;
+  background: #e2e8f0;
+  color: var(--text);
+  border-radius: 5px;
+}
+.btn-dl:hover { background: #cbd5e1; }

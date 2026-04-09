@@ -31,10 +31,20 @@
       <div class="file-section">
         <h3>Datasheets <span class="hint">(PDF → datasheets/)</span></h3>
         <ul id="datasheet-list" class="file-list"></ul>
+        <label class="upload-zone" id="datasheet-drop">
+          <input type="file" accept=".pdf" multiple hidden id="datasheet-input"
+                 onchange="uploadFiles('datasheet', this.files)" />
+          <span>+ Add PDFs</span>
+        </label>
       </div>
       <div class="file-section">
         <h3>STEP Files <span class="hint">(→ step_files/)</span></h3>
         <ul id="step-list" class="file-list"></ul>
+        <label class="upload-zone" id="step-drop">
+          <input type="file" accept=".step,.stp" multiple hidden id="step-input"
+                 onchange="uploadFiles('step', this.files)" />
+          <span>+ Add STEP/STP</span>
+        </label>
       </div>
       <button class="btn-secondary" onclick="refreshStatus()">Refresh</button>
       <button class="btn-danger" onclick="clearHistory()" title="Clear conversation history (keeps circuit)">Reset Conversation</button>
@@ -48,7 +58,7 @@
     <div id="missing-alert" class="alert alert-warning" style="display:none">
       <strong>Missing datasheets:</strong>
       <span id="missing-parts-list"></span><br/>
-      <small>Add the PDF(s) to <code>projects/&lt;name&gt;/datasheets/</code> then re-send your prompt.</small>
+      <small>Upload the PDF(s) using the <strong>+ Add PDFs</strong> button in the left panel, then re-send your prompt.</small>
     </div>
 
     <div class="prompt-area">
@@ -72,6 +82,11 @@
         <button onclick="zoomReset()" title="Fit">Fit</button>
         <button onclick="downloadSvg()" title="Download SVG">↓ SVG</button>
       </div>
+    </div>
+    <div class="download-bar">
+      <button class="btn-dl" onclick="downloadFile('circuit')" title="Download circuit.json">↓ JSON</button>
+      <button class="btn-dl" onclick="downloadFile('context')" title="Download circuit_context.md">↓ Context</button>
+      <button class="btn-dl" onclick="downloadFile('recreate')" title="Download recreate_prompt.md">↓ Recreate</button>
     </div>
     <div id="svg-container" class="svg-container">
       <div id="svg-panel" class="svg-panel">
@@ -110,6 +125,7 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   setupSvgPan();
+  setupUploadDropZones();
 });
 
 // ---------------------------------------------------------------------------
@@ -169,11 +185,11 @@ async function refreshStatus() {
   if (!res.ok) return;
   const data = await res.json();
 
-  renderFileList('datasheet-list', data.datasheets, '.pdf');
-  renderFileList('step-list', data.step_files, '.step');
+  renderFileList('datasheet-list', data.datasheets, '.pdf', `/files/datasheet/${currentProject}`);
+  renderFileList('step-list', data.step_files, '.step', `/files/step/${currentProject}`);
 }
 
-function renderFileList(listId, items, ext) {
+function renderFileList(listId, items, ext, deleteEndpoint) {
   const list = document.getElementById(listId);
   list.innerHTML = '';
   if (!items.length) {
@@ -186,7 +202,30 @@ function renderFileList(listId, items, ext) {
   items.forEach(name => {
     const li = document.createElement('li');
     li.className = 'file-item present';
-    li.textContent = name + ext;
+    li.style.cssText = 'display:flex;align-items:center;justify-content:space-between;';
+
+    const label = document.createElement('span');
+    label.textContent = name + ext;
+    label.style.cssText = 'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
+
+    const del = document.createElement('button');
+    del.textContent = '×';
+    del.title = `Delete ${name}${ext}`;
+    del.style.cssText = 'padding:0 5px;font-size:13px;line-height:1;background:#fee2e2;color:#dc2626;border:none;border-radius:4px;cursor:pointer;flex-shrink:0;margin-left:4px;';
+    del.onclick = async (e) => {
+      e.stopPropagation();
+      if (!confirm(`Delete ${name}${ext}?`)) return;
+      const res = await fetch(`${deleteEndpoint}/${encodeURIComponent(name + ext)}`, {method: 'DELETE'});
+      if (res.ok) {
+        refreshStatus();
+      } else {
+        const d = await res.json().catch(() => ({}));
+        showMessage('error', d.detail || 'Delete failed.');
+      }
+    };
+
+    li.appendChild(label);
+    li.appendChild(del);
     list.appendChild(li);
   });
 }
@@ -360,6 +399,63 @@ function setupSvgPan() {
     svgZoom = Math.min(Math.max(svgZoom * delta, 0.1), 8);
     applyTransform();
   }, {passive: false});
+}
+
+// ---------------------------------------------------------------------------
+// File upload
+// ---------------------------------------------------------------------------
+async function uploadFiles(type, files) {
+  if (!currentProject || !files.length) return;
+  const fd = new FormData();
+  for (const f of files) fd.append('files', f);
+
+  const res = await fetch(`/upload/${type}/${currentProject}`, {method: 'POST', body: fd});
+  const data = await res.json().catch(() => ({}));
+  if (res.ok) {
+    showMessage('info', `Uploaded: ${data.saved.join(', ')}`);
+    refreshStatus();
+  } else {
+    showMessage('error', data.detail || 'Upload failed.');
+  }
+  document.getElementById(`${type}-input`).value = '';
+}
+
+function setupUploadDropZones() {
+  setupDropZone('datasheet-drop', 'datasheet');
+  setupDropZone('step-drop', 'step');
+}
+
+function setupDropZone(zoneId, type) {
+  const zone = document.getElementById(zoneId);
+  zone.addEventListener('dragover', (e) => { e.preventDefault(); zone.classList.add('dragover'); });
+  zone.addEventListener('dragleave', () => zone.classList.remove('dragover'));
+  zone.addEventListener('drop', (e) => {
+    e.preventDefault();
+    zone.classList.remove('dragover');
+    uploadFiles(type, e.dataTransfer.files);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// File download (circuit JSON / context md / recreate md)
+// ---------------------------------------------------------------------------
+async function downloadFile(type) {
+  if (!currentProject) return;
+  const res = await fetch(`/download/${type}/${currentProject}`);
+  if (!res.ok) {
+    const d = await res.json().catch(() => ({}));
+    showMessage('error', d.detail || `Download failed (${res.status}).`);
+    return;
+  }
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  const cd = res.headers.get('Content-Disposition') || '';
+  const m = cd.match(/filename="?([^"]+)"?/);
+  a.download = m ? m[1] : `${currentProject}_${type}`;
+  a.click();
+  URL.revokeObjectURL(url);
 }
 </script>
 </body>
