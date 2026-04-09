@@ -18,7 +18,7 @@ from pathlib import Path
 
 import anthropic
 
-MODEL = "claude-opus-4-6"
+MODEL = "claude-sonnet-4-6"
 MAX_TOKENS = 8192
 HISTORY_WINDOW = 10  # keep last N turns to stay within context budget
 
