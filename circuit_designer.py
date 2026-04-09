@@ -30,9 +30,11 @@ You help users design circuits iteratively through natural-language conversation
 
 ## Output format (MANDATORY)
 
-Every response MUST follow this exact structure with no deviations:
+Every response MUST follow this exact structure with absolutely no deviations.
+Do NOT add any text, explanation, or code fences before or after the JSON.
+Do NOT wrap the JSON in ```json or any other markdown formatting.
 
-1. A single raw JSON object (no markdown code fences, no surrounding text before it).
+1. A single raw JSON object starting with { on the very first character.
 2. Immediately followed by the exact delimiter on its own line: ---MARKDOWN---
 3. Followed by two subsections:
 
@@ -235,8 +237,23 @@ def _parse_response(raw_text: str) -> tuple[dict, str, str]:
     json_part = parts[0].strip()
     markdown_part = parts[1].strip() if len(parts) > 1 else ""
 
+    # Strip markdown code fences if Claude wrapped the JSON (e.g. ```json ... ```)
+    json_part = re.sub(r"^```[a-zA-Z]*\n?", "", json_part).rstrip("`").strip()
+
     # Extract outermost {...} using a bracket counter
-    circuit_dict = _extract_json(json_part)
+    try:
+        circuit_dict = _extract_json(json_part)
+    except ValueError:
+        # If delimiter was missing, try extracting JSON from the full raw response
+        try:
+            circuit_dict = _extract_json(raw_text)
+            markdown_part = raw_text[raw_text.rfind("}") + 1:].strip()
+        except ValueError:
+            preview = raw_text[:400].replace("\n", " ")
+            raise ValueError(
+                f"Could not parse JSON from Claude's response. "
+                f"First 400 chars: {preview}"
+            )
 
     # Split markdown into context and recreate sections
     context_md = markdown_part
