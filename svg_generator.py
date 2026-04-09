@@ -350,14 +350,34 @@ def _normalize_to_canvas(
     top_margin: float,
     left_margin: float = COMP_PADDING,
 ) -> None:
-    """Translate all components so none escape the top or left canvas boundary."""
+    """Translate all components to fit within canvas bounds.
+
+    Centers the layout in the available space. If the layout is too large for
+    the canvas in any dimension, it aligns to the left/top margins so at least
+    those edges remain clean.
+    """
     if not components:
         return
+
     min_x = min(c["position"]["x"] - COMP_PADDING for c in components)
     min_y = min(c["position"]["y"] - COMP_PADDING for c in components)
-    shift_x = max(0.0, left_margin - min_x)
-    shift_y = max(0.0, top_margin - min_y)
-    if shift_x > 0 or shift_y > 0:
+    max_x = max(c["position"]["x"] + c["bounding_box"]["width"] + COMP_PADDING
+                for c in components)
+    max_y = max(c["position"]["y"] + _eff_h(c) + COMP_PADDING
+                for c in components)
+
+    content_w = max_x - min_x
+    content_h = max_y - min_y
+    avail_w = CANVAS_W - left_margin - COMP_PADDING
+    avail_h = CANVAS_H - top_margin - COMP_PADDING
+
+    # Centre if content fits; otherwise just pin to the left/top margin.
+    shift_x = (left_margin + (avail_w - content_w) / 2 - min_x
+               if content_w <= avail_w else left_margin - min_x)
+    shift_y = (top_margin + (avail_h - content_h) / 2 - min_y
+               if content_h <= avail_h else top_margin - min_y)
+
+    if abs(shift_x) > 0.5 or abs(shift_y) > 0.5:
         for c in components:
             c["position"]["x"] += shift_x
             c["position"]["y"] += shift_y
