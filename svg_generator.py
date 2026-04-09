@@ -26,6 +26,104 @@ GND_STROKE = "#222222"
 NET_LABEL_FILL = "#ffffff"
 NET_LABEL_STROKE = "#888888"
 GRID = 10
+WIRE_SPACING = 10   # px to shift bend point when a conflict is detected
+SEG_TOL = 3.0       # px tolerance for "same axis" overlap check
+
+
+# ---------------------------------------------------------------------------
+# Segment registry — tracks axis-aligned wire segments to prevent overlap
+# ---------------------------------------------------------------------------
+
+class _SegmentRegistry:
+    """
+    Keeps a list of horizontal and vertical wire segments already drawn.
+    Used to detect overlapping routes and choose an offset bend point.
+    """
+
+    def __init__(self, tol: float = SEG_TOL):
+        self._h: list[tuple[float, float, float]] = []  # (y, xmin, xmax)
+        self._v: list[tuple[float, float, float]] = []  # (x, ymin, ymax)
+        self._tol = tol
+
+    def _h_conflict(self, y: float, x1: float, x2: float) -> bool:
+        xmin, xmax = min(x1, x2), max(x1, x2)
+        if xmax - xmin < self._tol:   # zero-length, skip
+            return False
+        for ey, exmin, exmax in self._h:
+            if abs(ey - y) < self._tol:
+                if xmin < exmax - self._tol and xmax > exmin + self._tol:
+                    return True
+        return False
+
+    def _v_conflict(self, x: float, y1: float, y2: float) -> bool:
+        ymin, ymax = min(y1, y2), max(y1, y2)
+        if ymax - ymin < self._tol:
+            return False
+        for ex, eymin, eymax in self._v:
+            if abs(ex - x) < self._tol:
+                if ymin < eymax - self._tol and ymax > eymin + self._tol:
+                    return True
+        return False
+
+    def register_h(self, y: float, x1: float, x2: float) -> None:
+        if abs(x2 - x1) >= self._tol:
+            self._h.append((y, min(x1, x2), max(x1, x2)))
+
+    def register_v(self, x: float, y1: float, y2: float) -> None:
+        if abs(y2 - y1) >= self._tol:
+            self._v.append((x, min(y1, y2), max(y1, y2)))
+
+    def route(
+        self,
+        p1: tuple[float, float],
+        p2: tuple[float, float],
+        max_tries: int = 9,
+    ) -> list[tuple[float, float]]:
+        """
+        Return an L-shaped waypoint list from p1 to p2, shifting the bend
+        point horizontally until no registered segment conflicts are found.
+        Registers the chosen segments before returning.
+        """
+        x1, y1 = p1
+        x2, y2 = p2
+
+        # Pure horizontal
+        if abs(y1 - y2) < self.tol:
+            self.register_h(y1, x1, x2)
+            return [p1, p2]
+
+        # Pure vertical
+        if abs(x1 - x2) < self.tol:
+            self.register_v(x1, y1, y2)
+            return [p1, p2]
+
+        # General: try offsets of the mid-x bend point
+        base_mid = (x1 + x2) / 2
+        offsets = [0]
+        for k in range(1, max_tries):
+            offsets.append( k * WIRE_SPACING)
+            offsets.append(-k * WIRE_SPACING)
+
+        for off in offsets:
+            mx = base_mid + off
+            if (not self._h_conflict(y1, x1, mx) and
+                    not self._v_conflict(mx, y1, y2) and
+                    not self._h_conflict(y2, mx, x2)):
+                self.register_h(y1, x1, mx)
+                self.register_v(mx, y1, y2)
+                self.register_h(y2, mx, x2)
+                return [p1, (mx, y1), (mx, y2), p2]
+
+        # Fallback: use base mid even if conflicted (draws on top — rare)
+        self.register_h(y1, x1, base_mid)
+        self.register_v(base_mid, y1, y2)
+        self.register_h(y2, base_mid, x2)
+        return [p1, (base_mid, y1), (base_mid, y2), p2]
+
+    # expose tol as property for the pure-H/V checks above
+    @property
+    def tol(self) -> float:
+        return self._tol
 
 
 def generate_svg(circuit: dict) -> str:
@@ -60,6 +158,7 @@ def generate_svg(circuit: dict) -> str:
             pin_endpoints[(comp["id"], pin["number"])] = ep
 
     # Draw wires first (behind components)
+    registry = _SegmentRegistry()
     wire_group = dwg.add(dwg.g(id="wires"))
     net_label_group = dwg.add(dwg.g(id="net-labels"))
     for net in nets:
@@ -78,13 +177,12 @@ def generate_svg(circuit: dict) -> str:
             else GND_STROKE if name.upper() in {"GND", "AGND", "DGND"} \
             else WIRE_STROKE
 
-        # Draw wires between consecutive pairs and to the first point
+        # Draw wires between consecutive pairs, avoiding overlaps
         if len(endpoints) >= 2:
             for i in range(len(endpoints) - 1):
-                waypoints = _route_wire(endpoints[i], endpoints[i + 1])
-                polyline_pts = waypoints
+                waypoints = registry.route(endpoints[i], endpoints[i + 1])
                 wire_group.add(dwg.polyline(
-                    points=polyline_pts,
+                    points=waypoints,
                     stroke=stroke,
                     stroke_width=WIRE_W,
                     fill="none",
@@ -147,17 +245,6 @@ def _pin_endpoint(comp: dict, pin: dict) -> tuple[float, float]:
         return (x + offset * w, y - PIN_STUB)
     else:  # bottom
         return (x + offset * w, y + h + PIN_STUB)
-
-
-def _route_wire(
-    p1: tuple[float, float],
-    p2: tuple[float, float],
-) -> list[tuple[float, float]]:
-    """
-    Manhattan (right-angle) routing: go horizontal from p1 to mid-x, then vertical.
-    """
-    mid_x = (p1[0] + p2[0]) / 2
-    return [p1, (mid_x, p1[1]), (mid_x, p2[1]), p2]
 
 
 def _midpoint(
