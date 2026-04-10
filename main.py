@@ -44,6 +44,11 @@ class PromptRequest(BaseModel):
     prompt: str
 
 
+class RegenSvgRequest(BaseModel):
+    canvas_w: int | None = None
+    canvas_h: int | None = None
+
+
 class PromptResponse(BaseModel):
     status: str                 # "ok" | "missing_datasheets" | "error"
     missing_parts: list[str]    # populated when status == "missing_datasheets"
@@ -250,7 +255,7 @@ async def clear_history(project_name: str):
 
 
 @app.post("/regenerate-svg/{project_name}")
-async def regenerate_svg(project_name: str):
+async def regenerate_svg(project_name: str, req: RegenSvgRequest = RegenSvgRequest()):
     """Re-render the SVG from the current circuit.json without calling Claude."""
     try:
         project = project_manager.open_project(project_name)
@@ -262,7 +267,7 @@ async def regenerate_svg(project_name: str):
         raise HTTPException(status_code=404, detail="No circuit.json found for this project.")
 
     try:
-        svg_content = svg_generator.generate_svg(circuit)
+        svg_content = svg_generator.generate_svg(circuit, min_w=req.canvas_w, min_h=req.canvas_h)
         project_manager.write_svg(project, svg_content)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"SVG generation failed: {e}")

@@ -147,10 +147,13 @@ class _SegmentRegistry:
         return self._tol
 
 
-def generate_svg(circuit: dict) -> str:
+def generate_svg(circuit: dict, min_w: int | None = None, min_h: int | None = None) -> str:
     """
     Convert a circuit dict (matching the JSON schema) to an SVG string.
     Returns the complete SVG as a str.
+
+    min_w / min_h: optional minimum canvas dimensions (px). The canvas will be
+    at least this large even if the component layout is smaller.
     """
     # ── Layout computation (all of this must happen before SVG creation) ──────
     components = copy.deepcopy(circuit.get("components", []))
@@ -176,6 +179,10 @@ def generate_svg(circuit: dict) -> str:
         _cw, _ch = CANVAS_W, CANVAS_H
     canvas_w = max(CANVAS_W, int(_cw) + 10)
     canvas_h = max(CANVAS_H, int(_ch) + 60)  # +60 for GND rail + title row
+    if min_w:
+        canvas_w = max(canvas_w, min_w)
+    if min_h:
+        canvas_h = max(canvas_h, min_h)
 
     # Assign rail Y positions using the real canvas height for GND
     rail_y: dict[str, float] = {}
