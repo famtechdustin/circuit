@@ -19,7 +19,7 @@ from pathlib import Path
 import anthropic
 
 MODEL = "claude-sonnet-4-6"
-MAX_TOKENS = 8192
+MAX_TOKENS = 16000
 HISTORY_WINDOW = 10  # keep last N turns to stay within context budget
 
 # In-memory conversation histories keyed by project name.
