@@ -47,6 +47,7 @@
         </label>
       </div>
       <button class="btn-secondary" onclick="refreshStatus()">Refresh</button>
+      <button class="btn-secondary" onclick="regenSvg()" title="Re-render SVG from current circuit.json (no API call)">Regen SVG</button>
       <button class="btn-danger" onclick="clearHistory()" title="Clear conversation history (keeps circuit)">Reset Conversation</button>
     </section>
   </aside>
@@ -228,6 +229,26 @@ function renderFileList(listId, items, ext, deleteEndpoint) {
     li.appendChild(del);
     list.appendChild(li);
   });
+}
+
+async function regenSvg() {
+  if (!currentProject) return;
+  const btn = event.target;
+  btn.disabled = true;
+  btn.textContent = 'Generating…';
+  try {
+    const res = await fetch(`/regenerate-svg/${currentProject}`, {method: 'POST'});
+    const data = await res.json().catch(() => ({}));
+    if (res.ok) {
+      await refreshSvg();
+      showMessage('info', 'SVG regenerated from circuit.json.');
+    } else {
+      showMessage('error', data.detail || 'SVG regeneration failed.');
+    }
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Regen SVG';
+  }
 }
 
 async function clearHistory() {

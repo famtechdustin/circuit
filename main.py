@@ -249,6 +249,27 @@ async def clear_history(project_name: str):
     return {"cleared": True, "project": project_name}
 
 
+@app.post("/regenerate-svg/{project_name}")
+async def regenerate_svg(project_name: str):
+    """Re-render the SVG from the current circuit.json without calling Claude."""
+    try:
+        project = project_manager.open_project(project_name)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    circuit = project_manager.read_circuit_json(project)
+    if circuit is None:
+        raise HTTPException(status_code=404, detail="No circuit.json found for this project.")
+
+    try:
+        svg_content = svg_generator.generate_svg(circuit)
+        project_manager.write_svg(project, svg_content)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"SVG generation failed: {e}")
+
+    return {"status": "ok"}
+
+
 # ---------------------------------------------------------------------------
 # Upload routes
 # ---------------------------------------------------------------------------
