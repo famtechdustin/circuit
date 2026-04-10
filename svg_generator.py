@@ -152,40 +152,53 @@ def generate_svg(circuit: dict) -> str:
     Convert a circuit dict (matching the JSON schema) to an SVG string.
     Returns the complete SVG as a str.
     """
-    dwg = svgwrite.Drawing(
-        size=(f"{CANVAS_W}px", f"{CANVAS_H}px"),
-        profile="full",
-    )
-    dwg.viewbox(0, 0, CANVAS_W, CANVAS_H)
-
-    # Background
-    dwg.add(dwg.rect(insert=(0, 0), size=(CANVAS_W, CANVAS_H), fill="#fafafa"))
-
-    # Grid dots (subtle)
-    grid_group = dwg.add(dwg.g(id="grid", opacity="0.15"))
-    for gx in range(0, CANVAS_W, GRID * 5):
-        for gy in range(0, CANVAS_H, GRID * 5):
-            grid_group.add(dwg.circle(center=(gx, gy), r=0.8, fill="#999"))
-
-    # Deep-copy so the resolver can adjust positions without mutating circuit.json
+    # ── Layout computation (all of this must happen before SVG creation) ──────
     components = copy.deepcopy(circuit.get("components", []))
     _resolve_overlaps(components)
 
     nets        = circuit.get("nets", [])
     power_rails = set(circuit.get("power_rails", []))
 
-    # Classify power rails and assign bus Y positions
     vcc_nets = sorted(n for n in power_rails if not _is_gnd_net(n))
     gnd_nets = sorted(n for n in power_rails if _is_gnd_net(n))
+
+    # Shift every component so the layout clears the top/left margins
+    top_margin = RAIL_TOP_START + max(1, len(vcc_nets)) * RAIL_SPACING + 50
+    _normalize_to_canvas(components, top_margin=top_margin)
+
+    # Dynamic canvas: grow to fit the actual component footprint
+    if components:
+        _cw = max(c["position"]["x"] + c["bounding_box"]["width"] + COMP_PADDING
+                  for c in components)
+        _ch = max(c["position"]["y"] + _eff_h(c) + COMP_PADDING
+                  for c in components)
+    else:
+        _cw, _ch = CANVAS_W, CANVAS_H
+    canvas_w = max(CANVAS_W, int(_cw) + 10)
+    canvas_h = max(CANVAS_H, int(_ch) + 60)  # +60 for GND rail + title row
+
+    # Assign rail Y positions using the real canvas height for GND
     rail_y: dict[str, float] = {}
     for i, n in enumerate(vcc_nets):
         rail_y[n] = RAIL_TOP_START + i * RAIL_SPACING
     for i, n in enumerate(gnd_nets):
-        rail_y[n] = RAIL_BOT_START - i * RAIL_SPACING
+        rail_y[n] = canvas_h - RAIL_TOP_START - i * RAIL_SPACING
 
-    # Reserve space below VCC rails before components start
-    top_margin = RAIL_TOP_START + max(1, len(vcc_nets)) * RAIL_SPACING + 50
-    _normalize_to_canvas(components, top_margin=top_margin)
+    # ── SVG creation ─────────────────────────────────────────────────────────
+    dwg = svgwrite.Drawing(
+        size=(f"{canvas_w}px", f"{canvas_h}px"),
+        profile="full",
+    )
+    dwg.viewbox(0, 0, canvas_w, canvas_h)
+
+    # Background
+    dwg.add(dwg.rect(insert=(0, 0), size=(canvas_w, canvas_h), fill="#fafafa"))
+
+    # Grid dots (subtle)
+    grid_group = dwg.add(dwg.g(id="grid", opacity="0.15"))
+    for gx in range(0, canvas_w, GRID * 5):
+        for gy in range(0, canvas_h, GRID * 5):
+            grid_group.add(dwg.circle(center=(gx, gy), r=0.8, fill="#999"))
 
     # Build pin lookups:
     #   pin_endpoints  — stub tip (the visible pin end)
@@ -275,7 +288,7 @@ def generate_svg(circuit: dict) -> str:
     revision = circuit.get("metadata", {}).get("revision", 1)
     dwg.add(dwg.text(
         f"{title}  Rev.{revision}",
-        insert=(10, CANVAS_H - 10),
+        insert=(10, canvas_h - 10),
         font_size=12,
         font_family="monospace",
         fill="#666",
@@ -350,33 +363,17 @@ def _normalize_to_canvas(
     top_margin: float,
     left_margin: float = COMP_PADDING,
 ) -> None:
-    """Translate all components to fit within canvas bounds.
+    """Shift all components so the layout clears the left and top margins.
 
-    Centers the layout in the available space. If the layout is too large for
-    the canvas in any dimension, it aligns to the left/top margins so at least
-    those edges remain clean.
+    The canvas is dynamic (sized after this call), so there is no right/bottom
+    limit to enforce here — the SVG simply grows to fit.
     """
     if not components:
         return
-
     min_x = min(c["position"]["x"] - COMP_PADDING for c in components)
     min_y = min(c["position"]["y"] - COMP_PADDING for c in components)
-    max_x = max(c["position"]["x"] + c["bounding_box"]["width"] + COMP_PADDING
-                for c in components)
-    max_y = max(c["position"]["y"] + _eff_h(c) + COMP_PADDING
-                for c in components)
-
-    content_w = max_x - min_x
-    content_h = max_y - min_y
-    avail_w = CANVAS_W - left_margin - COMP_PADDING
-    avail_h = CANVAS_H - top_margin - COMP_PADDING
-
-    # Centre if content fits; otherwise just pin to the left/top margin.
-    shift_x = (left_margin + (avail_w - content_w) / 2 - min_x
-               if content_w <= avail_w else left_margin - min_x)
-    shift_y = (top_margin + (avail_h - content_h) / 2 - min_y
-               if content_h <= avail_h else top_margin - min_y)
-
+    shift_x = left_margin - min_x
+    shift_y = top_margin - min_y
     if abs(shift_x) > 0.5 or abs(shift_y) > 0.5:
         for c in components:
             c["position"]["x"] += shift_x
