@@ -178,14 +178,14 @@ def design_step(
         history = history[-(HISTORY_WINDOW * 2):]
         _histories[project_name] = history
 
-    response = client.messages.create(
+    with client.messages.stream(
         model=MODEL,
         max_tokens=MAX_TOKENS,
         system=SYSTEM_PROMPT,
         messages=history,
-    )
+    ) as stream:
+        raw_text = stream.get_final_text()
 
-    raw_text = response.content[0].text
     history.append({"role": "assistant", "content": raw_text})
 
     circuit_dict, context_md, recreate_md = _parse_response(raw_text)
