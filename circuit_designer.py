@@ -13,6 +13,7 @@ Output contract with Claude:
 
 import json
 import os
+import time
 import re
 from pathlib import Path
 
@@ -178,13 +179,23 @@ def design_step(
         history = history[-(HISTORY_WINDOW * 2):]
         _histories[project_name] = history
 
-    with client.messages.stream(
-        model=MODEL,
-        max_tokens=MAX_TOKENS,
-        system=SYSTEM_PROMPT,
-        messages=history,
-    ) as stream:
-        raw_text = stream.get_final_text()
+    last_exc: Exception | None = None
+    for attempt in range(3):
+        try:
+            with client.messages.stream(
+                model=MODEL,
+                max_tokens=MAX_TOKENS,
+                system=SYSTEM_PROMPT,
+                messages=history,
+            ) as stream:
+                raw_text = stream.get_final_text()
+            break
+        except Exception as e:
+            last_exc = e
+            if attempt < 2:
+                time.sleep(2 ** (attempt + 1))  # 2 s, 4 s
+    else:
+        raise last_exc
 
     history.append({"role": "assistant", "content": raw_text})
 
