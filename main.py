@@ -21,6 +21,7 @@ from pydantic import BaseModel
 import circuit_designer
 import datasheet_reader
 import kicad_parser
+import part_finder
 import project_manager
 import svg_generator
 
@@ -47,6 +48,10 @@ class PromptRequest(BaseModel):
 class RegenSvgRequest(BaseModel):
     canvas_w: int | None = None
     canvas_h: int | None = None
+
+
+class FetchPartsRequest(BaseModel):
+    parts: list[str]
 
 
 class PromptResponse(BaseModel):
@@ -273,6 +278,35 @@ async def regenerate_svg(project_name: str, req: RegenSvgRequest = RegenSvgReque
         raise HTTPException(status_code=500, detail=f"SVG generation failed: {e}")
 
     return {"status": "ok"}
+
+
+@app.post("/fetch-parts/{project_name}")
+async def fetch_parts(project_name: str, req: FetchPartsRequest):
+    """
+    For each part in the list, search public sources and save:
+      - PDF datasheet  → projects/<name>/datasheets/<part>.pdf
+      - KiCad symbol   → projects/<name>/kicad_symbols/<part>.kicad_sym
+    Returns per-part results without calling Claude.
+    """
+    try:
+        project = project_manager.open_project(project_name)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    project.symbols_dir.mkdir(parents=True, exist_ok=True)
+
+    async def _fetch_one(p: str) -> dict:
+        ds_bytes, ds_status = await part_finder.find_datasheet(p)
+        sym_text, sym_status = await part_finder.find_kicad_symbol(p)
+        if ds_bytes:
+            (project.datasheets_dir / f"{p}.pdf").write_bytes(ds_bytes)
+        if sym_text:
+            (project.symbols_dir / f"{p}.kicad_sym").write_text(sym_text, encoding="utf-8")
+        return {"part": p, "datasheet": ds_status, "symbol": sym_status}
+
+    import asyncio
+    results = await asyncio.gather(*[_fetch_one(p) for p in req.parts])
+    return {"results": list(results)}
 
 
 # ---------------------------------------------------------------------------

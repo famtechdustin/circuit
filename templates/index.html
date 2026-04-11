@@ -26,6 +26,14 @@
       <ul id="project-list" class="file-list"></ul>
     </section>
 
+    <section id="parts-finder" style="display:none">
+      <h2>Parts Finder</h2>
+      <p class="hint" style="margin-bottom:6px">Enter part numbers — datasheets&nbsp;&amp;&nbsp;KiCad symbols are fetched automatically.</p>
+      <textarea id="parts-input" rows="5" placeholder="FT231XS&#10;AMS1117-3.3&#10;MMBT3904&#10;(one per line or comma-separated)" style="width:100%;font-size:11px;resize:vertical"></textarea>
+      <button onclick="fetchParts()" id="fetch-parts-btn" style="margin-top:4px;width:100%">Fetch Datasheets + Symbols</button>
+      <ul id="parts-results" class="file-list" style="margin-top:6px"></ul>
+    </section>
+
     <section id="file-status" style="display:none">
       <h2>Files</h2>
       <div class="file-section">
@@ -175,6 +183,7 @@ async function createProject() {
 async function selectProject(name) {
   currentProject = name;
   document.getElementById('project-badge').textContent = name;
+  document.getElementById('parts-finder').style.display = '';
   document.getElementById('file-status').style.display = '';
   document.getElementById('prompt-input').disabled = false;
   document.getElementById('send-btn').disabled = false;
@@ -234,6 +243,49 @@ function renderFileList(listId, items, ext, deleteEndpoint) {
     li.appendChild(del);
     list.appendChild(li);
   });
+}
+
+async function fetchParts() {
+  if (!currentProject) return;
+  const raw = document.getElementById('parts-input').value.trim();
+  if (!raw) return;
+  const parts = raw.split(/[\n,]+/).map(p => p.trim()).filter(Boolean);
+
+  const btn = document.getElementById('fetch-parts-btn');
+  const resultsList = document.getElementById('parts-results');
+  btn.disabled = true;
+  btn.textContent = 'Searching…';
+  resultsList.innerHTML = '<li class="file-item">Fetching ' + parts.length + ' part(s)…</li>';
+
+  try {
+    const res = await fetch(`/fetch-parts/${currentProject}`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({parts}),
+    });
+    const data = await res.json().catch(() => ({}));
+    resultsList.innerHTML = '';
+    if (!res.ok) {
+      const li = document.createElement('li');
+      li.className = 'file-item';
+      li.textContent = 'Error: ' + (data.detail || 'fetch failed');
+      resultsList.appendChild(li);
+      return;
+    }
+    for (const r of (data.results || [])) {
+      const li = document.createElement('li');
+      li.className = 'file-item';
+      const ds = r.datasheet === 'found' ? '✓ PDF' : '✗ PDF';
+      const sym = r.symbol  === 'found' ? '✓ KiCad' : '✗ KiCad';
+      li.innerHTML = `<strong>${escapeHtml(r.part)}</strong> &nbsp; ${ds} &nbsp; ${sym}`;
+      li.style.cssText = 'display:flex;gap:8px;align-items:center;';
+      resultsList.appendChild(li);
+    }
+    await refreshStatus();
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Fetch Datasheets + Symbols';
+  }
 }
 
 async function regenSvg() {
