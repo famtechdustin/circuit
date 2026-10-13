@@ -7,9 +7,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application source
-COPY main.py circuit_designer.py project_manager.py \
-     datasheet_reader.py kicad_parser.py svg_generator.py part_finder.py \
-     bom_importer.py ./
+COPY *.py ./
 
 COPY templates/ templates/
 COPY static/ static/

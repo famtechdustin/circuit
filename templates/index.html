@@ -103,6 +103,8 @@
     </div>
   </main>
 
+  <div id="panel-resizer" class="panel-resizer" title="Drag to resize · double-click to reset"></div>
+
   <!-- RIGHT PANEL: SVG schematic -->
   <aside class="panel panel-right">
     <div class="svg-toolbar">
@@ -157,6 +159,7 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   setupSvgPan();
+  setupPanelResizer();
   setupUploadDropZones();
 });
 
@@ -708,6 +711,63 @@ function setupSvgPan() {
     svgZoom = Math.min(Math.max(svgZoom * delta, 0.1), 8);
     applyTransform();
   }, {passive: false});
+}
+
+// Right panel width resizing
+const RIGHT_PANEL_DEFAULT_W = 420;
+const RIGHT_PANEL_MIN_W = 300;
+const CENTER_PANEL_MIN_W = 320;
+
+function setRightPanelWidth(w) {
+  const panel = document.querySelector('.panel-right');
+  const layout = document.querySelector('.layout');
+  const left = document.querySelector('.panel-left');
+  const resizer = document.getElementById('panel-resizer');
+  const maxW = layout.clientWidth - left.offsetWidth - resizer.offsetWidth - CENTER_PANEL_MIN_W;
+  const clamped = Math.max(RIGHT_PANEL_MIN_W, Math.min(w, maxW));
+  panel.style.width = `${clamped}px`;
+  return clamped;
+}
+
+function setupPanelResizer() {
+  const resizer = document.getElementById('panel-resizer');
+  const panel = document.querySelector('.panel-right');
+
+  const saved = parseInt(localStorage.getItem('rightPanelWidth'), 10);
+  if (saved) setRightPanelWidth(saved);
+
+  let startX = 0;
+  let startW = 0;
+  let dragging = false;
+
+  resizer.addEventListener('mousedown', (e) => {
+    e.preventDefault();
+    dragging = true;
+    startX = e.clientX;
+    startW = panel.offsetWidth;
+    resizer.classList.add('active');
+    document.body.classList.add('resizing');
+  });
+
+  window.addEventListener('mousemove', (e) => {
+    if (!dragging) return;
+    setRightPanelWidth(startW + (startX - e.clientX));
+  });
+
+  window.addEventListener('mouseup', () => {
+    if (!dragging) return;
+    dragging = false;
+    resizer.classList.remove('active');
+    document.body.classList.remove('resizing');
+    localStorage.setItem('rightPanelWidth', panel.offsetWidth);
+  });
+
+  resizer.addEventListener('dblclick', () => {
+    setRightPanelWidth(RIGHT_PANEL_DEFAULT_W);
+    localStorage.removeItem('rightPanelWidth');
+  });
+
+  window.addEventListener('resize', () => setRightPanelWidth(panel.offsetWidth));
 }
 
 // ---------------------------------------------------------------------------
