@@ -4,6 +4,9 @@
 # Runtime project data (contains user files and generated circuits)
 projects/
 
+# Downloaded KiCad symbol libraries and index
+cache/
+
 # Python
 __pycache__/
 *.pyc

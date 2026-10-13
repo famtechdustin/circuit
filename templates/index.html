@@ -32,6 +32,23 @@
       <textarea id="parts-input" rows="5" placeholder="FT231XS&#10;AMS1117-3.3&#10;MMBT3904&#10;(one per line or comma-separated)" style="width:100%;font-size:11px;resize:vertical"></textarea>
       <button onclick="fetchParts()" id="fetch-parts-btn" style="margin-top:4px;width:100%">Fetch Datasheets + Symbols</button>
       <ul id="parts-results" class="file-list" style="margin-top:6px"></ul>
+
+      <label class="upload-zone" id="bom-drop" style="margin-top:8px">
+        <input type="file" accept=".csv,.txt" hidden id="bom-input"
+               onchange="importBom(this.files)" />
+        <span id="bom-drop-label">+ Import BOM (DipTrace CSV)</span>
+      </label>
+      <div id="bom-report" style="display:none">
+        <div id="bom-summary" class="bom-summary"></div>
+        <div class="bom-table-wrap">
+          <table class="bom-table">
+            <thead><tr><th>RefDes</th><th>Qty</th><th>MPN</th><th>PDF</th><th>KiCad</th></tr></thead>
+            <tbody id="bom-rows"></tbody>
+          </table>
+        </div>
+        <button class="btn-secondary" id="bom-retry-btn" onclick="retryFlagged()" style="margin-top:6px">Retry flagged</button>
+        <button class="btn-secondary" onclick="showPartDescriptionForm()" style="margin-top:6px">Describe parts</button>
+      </div>
     </section>
 
     <section id="file-status" style="display:none">
@@ -101,6 +118,7 @@
       <button class="btn-dl" onclick="downloadFile('circuit')" title="Download circuit.json">↓ JSON</button>
       <button class="btn-dl" onclick="downloadFile('context')" title="Download circuit_context.md">↓ Context</button>
       <button class="btn-dl" onclick="downloadFile('recreate')" title="Download recreate_prompt.md">↓ Recreate</button>
+      <button class="btn-dl" onclick="downloadFile('eagle')" title="EAGLE .sch — DipTrace: File → Import → Eagle">↓ DipTrace (.sch)</button>
     </div>
     <div id="svg-container" class="svg-container">
       <div id="svg-panel" class="svg-panel">
@@ -192,6 +210,7 @@ async function selectProject(name) {
 
   await refreshStatus();
   await refreshSvg();
+  await loadBomReport();
 }
 
 async function refreshStatus() {
@@ -282,10 +301,216 @@ async function fetchParts() {
       resultsList.appendChild(li);
     }
     await refreshStatus();
+    if (bomReport) await loadBomReport();
   } finally {
     btn.disabled = false;
     btn.textContent = 'Fetch Datasheets + Symbols';
   }
+}
+
+// ---------------------------------------------------------------------------
+// BOM import
+// ---------------------------------------------------------------------------
+let bomReport = null;
+
+async function importBom(files) {
+  if (!currentProject || !files.length) return;
+  const label = document.getElementById('bom-drop-label');
+  const fd = new FormData();
+  fd.append('file', files[0]);
+  label.textContent = `Importing ${files[0].name}… (this can take a few minutes)`;
+
+  try {
+    const res = await fetch(`/import-bom/${currentProject}`, {method: 'POST', body: fd});
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      showMessage('error', data.detail || 'BOM import failed.');
+      return;
+    }
+    renderBomReport(data);
+    const s = data.summary;
+    showMessage(s.flagged ? 'warning' : 'info',
+      `BOM imported: ${s.searched} part(s) searched, ${s.flagged} missing files, ${s.generic} generic skipped.`);
+    await refreshStatus();
+    await showPartDescriptionForm();
+  } catch (err) {
+    showMessage('error', 'BOM import failed: ' + err.message);
+  } finally {
+    label.textContent = '+ Import BOM (DipTrace CSV)';
+    document.getElementById('bom-input').value = '';
+  }
+}
+
+async function loadBomReport() {
+  bomReport = null;
+  document.getElementById('bom-report').style.display = 'none';
+  if (!currentProject) return;
+  const res = await fetch(`/bom/${currentProject}`);
+  if (res.ok) renderBomReport(await res.json());
+}
+
+function renderBomReport(report) {
+  bomReport = report;
+  const s = report.summary;
+  const summary = document.getElementById('bom-summary');
+  summary.textContent = s.flagged
+    ? `${s.flagged} of ${s.searched} parts missing files`
+    : `All ${s.searched} parts have a datasheet and symbol`;
+  if (s.generic) summary.textContent += ` (${s.generic} generic skipped)`;
+  summary.className = 'bom-summary' + (s.flagged ? ' flagged' : ' ok');
+
+  const tbody = document.getElementById('bom-rows');
+  tbody.innerHTML = '';
+  for (const r of report.rows) {
+    const tr = document.createElement('tr');
+    tr.className = r.generic ? 'generic' : (r.flagged ? 'flagged' : '');
+
+    const ref = document.createElement('td');
+    ref.textContent = (r.refdes || []).join(', ');
+    ref.title = ref.textContent;
+    const qty = document.createElement('td');
+    qty.textContent = r.qty;
+    const mpn = document.createElement('td');
+    mpn.textContent = r.generic && r.value ? `${r.mpn} ${r.value}` : r.mpn;
+    mpn.title = [r.manufacturer, r.pattern, r.symbol_match && r.symbol_match !== r.mpn ? `KiCad: ${r.symbol_match}` : '']
+      .filter(Boolean).join(' | ');
+    if (r.product_url) {
+      const a = document.createElement('a');
+      a.href = r.product_url;
+      a.target = '_blank';
+      a.rel = 'noopener';
+      a.textContent = mpn.textContent;
+      mpn.textContent = '';
+      mpn.appendChild(a);
+    }
+
+    tr.append(ref, qty, mpn, bomStatusCell(r.datasheet, r.datasheet_source), bomStatusCell(r.symbol));
+    tbody.appendChild(tr);
+  }
+
+  document.getElementById('bom-retry-btn').style.display = s.flagged ? '' : 'none';
+  document.getElementById('bom-report').style.display = '';
+}
+
+function bomStatusCell(status, source) {
+  const td = document.createElement('td');
+  if (status === 'found') {
+    td.textContent = '✓';
+    td.className = 'ok';
+    if (source) td.title = `Source: ${source}`;
+  } else if (status === 'skipped') {
+    td.textContent = '–';
+    td.title = 'Generic part, not searched';
+  } else {
+    td.textContent = '✗';
+    td.className = 'missing';
+    td.title = status;
+  }
+  return td;
+}
+
+async function retryFlagged() {
+  if (!currentProject || !bomReport) return;
+  const parts = bomReport.rows.filter(r => r.flagged && !r.generic).map(r => r.mpn);
+  if (!parts.length) return;
+
+  const btn = document.getElementById('bom-retry-btn');
+  btn.disabled = true;
+  btn.textContent = `Retrying ${parts.length}…`;
+  try {
+    const res = await fetch(`/fetch-parts/${currentProject}`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({parts}),
+    });
+    if (!res.ok) {
+      const d = await res.json().catch(() => ({}));
+      showMessage('error', d.detail || 'Retry failed.');
+      return;
+    }
+    await loadBomReport();
+    await refreshStatus();
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Retry flagged';
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Part descriptions (asked after BOM import, sent to Claude with every prompt)
+// ---------------------------------------------------------------------------
+async function showPartDescriptionForm() {
+  if (!currentProject || !bomReport) return;
+  const mainParts = bomReport.rows.filter(r => !r.generic);
+  if (!mainParts.length) return;
+
+  document.getElementById('part-desc-form')?.remove();
+  const res = await fetch(`/part-descriptions/${currentProject}`);
+  const saved = res.ok ? await res.json() : {overview: '', parts: {}};
+
+  const card = document.createElement('div');
+  card.id = 'part-desc-form';
+  card.className = 'chat-msg assistant part-desc';
+
+  const intro = document.createElement('p');
+  intro.textContent = 'What does this board do, and what does each main part do in it? '
+    + 'These notes are sent to Claude with every design prompt.';
+
+  const overview = document.createElement('textarea');
+  overview.rows = 2;
+  overview.placeholder = 'Board overview, e.g. "USB-powered sensor logger with a 3.3 V MCU and RS-485 output"';
+  overview.value = saved.overview || '';
+
+  const rows = document.createElement('div');
+  rows.className = 'part-desc-rows';
+  const inputs = [];
+  for (const r of mainParts) {
+    const name = document.createElement('span');
+    name.className = 'part-desc-name';
+    name.textContent = r.mpn;
+    name.title = [(r.refdes || []).join(', '), r.manufacturer].filter(Boolean).join(' | ');
+    const inp = document.createElement('input');
+    inp.type = 'text';
+    inp.placeholder = (r.refdes || []).join(', ') + ' — what is it for?';
+    inp.value = (saved.parts || {})[r.mpn] || '';
+    inputs.push([r.mpn, inp]);
+    rows.append(name, inp);
+  }
+
+  const actions = document.createElement('div');
+  actions.className = 'part-desc-actions';
+  const saveBtn = document.createElement('button');
+  saveBtn.textContent = 'Save descriptions';
+  const skipBtn = document.createElement('button');
+  skipBtn.className = 'btn-secondary';
+  skipBtn.textContent = 'Skip';
+  skipBtn.onclick = () => card.remove();
+  saveBtn.onclick = async () => {
+    saveBtn.disabled = true;
+    const body = {overview: overview.value, parts: Object.fromEntries(inputs.map(([m, i]) => [m, i.value]))};
+    const r = await fetch(`/part-descriptions/${currentProject}`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      saveBtn.disabled = false;
+      showMessage('error', d.detail || 'Saving descriptions failed.');
+      return;
+    }
+    card.remove();
+    showMessage('info', `Saved descriptions for ${Object.keys(d.parts).length} part(s). `
+      + 'Describe the circuit you want below to start the design.');
+    document.getElementById('prompt-input').focus();
+  };
+  actions.append(saveBtn, skipBtn);
+
+  card.append(intro, overview, rows, actions);
+  const thread = document.getElementById('chat-thread');
+  thread.appendChild(card);
+  thread.scrollTop = thread.scrollHeight;
+  (inputs.find(([, i]) => !i.value)?.[1] || overview).focus();
 }
 
 async function regenSvg() {
@@ -507,16 +732,18 @@ async function uploadFiles(type, files) {
 function setupUploadDropZones() {
   setupDropZone('datasheet-drop', 'datasheet');
   setupDropZone('step-drop', 'step');
+  setupDropZone('bom-drop', 'bom', importBom);
 }
 
-function setupDropZone(zoneId, type) {
+function setupDropZone(zoneId, type, onDrop = null) {
   const zone = document.getElementById(zoneId);
   zone.addEventListener('dragover', (e) => { e.preventDefault(); zone.classList.add('dragover'); });
   zone.addEventListener('dragleave', () => zone.classList.remove('dragover'));
   zone.addEventListener('drop', (e) => {
     e.preventDefault();
     zone.classList.remove('dragover');
-    uploadFiles(type, e.dataTransfer.files);
+    if (onDrop) onDrop(e.dataTransfer.files);
+    else uploadFiles(type, e.dataTransfer.files);
   });
 }
 

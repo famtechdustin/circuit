@@ -416,6 +416,87 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 }
 
 /* ------------------------------------------------------------------ */
+/* BOM import report (left panel)                                       */
+/* ------------------------------------------------------------------ */
+.bom-summary {
+  margin-top: 8px;
+  padding: 5px 8px;
+  border-radius: 5px;
+  font-size: 11px;
+  font-weight: 600;
+}
+.bom-summary.ok { background: #f0fdf4; color: #166534; }
+.bom-summary.flagged { background: #fef2f2; color: var(--danger); }
+
+.bom-table-wrap {
+  margin-top: 4px;
+  max-height: 280px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+}
+.bom-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 10px;
+  font-family: var(--mono);
+  table-layout: fixed;
+}
+.bom-table th {
+  position: sticky;
+  top: 0;
+  background: #f1f5f9;
+  color: var(--text-muted);
+  font-weight: 600;
+  text-align: left;
+  padding: 3px 4px;
+}
+.bom-table td {
+  padding: 3px 4px;
+  border-top: 1px solid var(--border);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.bom-table th:nth-child(1), .bom-table td:nth-child(1) { width: 22%; }
+.bom-table th:nth-child(2), .bom-table td:nth-child(2) { width: 10%; }
+.bom-table th:nth-child(3), .bom-table td:nth-child(3) { width: 38%; }
+.bom-table th:nth-child(4), .bom-table td:nth-child(4) { width: 12%; text-align: center; }
+.bom-table th:nth-child(5), .bom-table td:nth-child(5) { width: 18%; text-align: center; }
+.bom-table td a { color: inherit; }
+.bom-table tr.flagged td { background: #fef2f2; }
+.bom-table tr.generic td { color: var(--text-muted); }
+.bom-table td.ok { color: #16a34a; font-weight: 700; }
+.bom-table td.missing { color: var(--danger); font-weight: 700; }
+
+/* ------------------------------------------------------------------ */
+/* Part descriptions form (chat card after BOM import)                  */
+/* ------------------------------------------------------------------ */
+.chat-msg.part-desc { width: 90%; display: flex; flex-direction: column; gap: 8px; }
+.part-desc textarea,
+.part-desc input {
+  width: 100%;
+  padding: 5px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 12px;
+  font-family: var(--font);
+  background: var(--surface);
+}
+.part-desc textarea { resize: vertical; }
+.part-desc-rows {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 4px 8px;
+  align-items: center;
+  max-height: 320px;
+  overflow-y: auto;
+}
+.part-desc-name { font-family: var(--mono); font-size: 11px; font-weight: 600; }
+.part-desc-actions { display: flex; gap: 6px; }
+
+/* ------------------------------------------------------------------ */
 /* Download bar (right panel, below SVG toolbar)                        */
 /* ------------------------------------------------------------------ */
 .download-bar {

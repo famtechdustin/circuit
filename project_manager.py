@@ -8,6 +8,8 @@ Each project lives at projects/<name>/ and contains:
   circuit_context.md — running circuit description
   recreate_prompt.md — single prompt to reproduce circuit
   schematic.svg     — latest generated SVG schematic
+  bom_report.json   — results of the last BOM import (per-part fetch status)
+  part_descriptions.json — user's description of the board and what each main part does
 """
 
 import json
@@ -27,6 +29,8 @@ class Project:
     context_md_path: Path
     recreate_md_path: Path
     svg_path: Path
+    bom_report_path: Path
+    part_descriptions_path: Path
 
 
 def _make_project(name: str) -> Project:
@@ -40,6 +44,8 @@ def _make_project(name: str) -> Project:
         context_md_path=root / "circuit_context.md",
         recreate_md_path=root / "recreate_prompt.md",
         svg_path=root / "schematic.svg",
+        bom_report_path=root / "bom_report.json",
+        part_descriptions_path=root / "part_descriptions.json",
     )
 
 
@@ -133,3 +139,31 @@ def read_svg(project: Project) -> str | None:
 
 def write_svg(project: Project, svg_content: str) -> None:
     project.svg_path.write_text(svg_content, encoding="utf-8")
+
+
+def read_bom_report(project: Project) -> dict | None:
+    """Return the saved BOM import report or None if no BOM was imported."""
+    if not project.bom_report_path.exists():
+        return None
+    try:
+        return json.loads(project.bom_report_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def write_bom_report(project: Project, report: dict) -> None:
+    project.bom_report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+
+
+def read_part_descriptions(project: Project) -> dict | None:
+    """Return {"overview": str, "parts": {mpn: description}} or None if never saved."""
+    if not project.part_descriptions_path.exists():
+        return None
+    try:
+        return json.loads(project.part_descriptions_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def write_part_descriptions(project: Project, data: dict) -> None:
+    project.part_descriptions_path.write_text(json.dumps(data, indent=2), encoding="utf-8")

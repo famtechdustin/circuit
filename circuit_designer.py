@@ -132,6 +132,17 @@ KiCad pin data takes precedence over defaults for pin assignments.
 Datasheets (if also provided) supply electrical specs, application circuits,
 and support component selection — but do NOT override KiCad pin numbers/names.
 
+## Design intent
+
+When the user has described the board and the role of its main parts, it appears as:
+  [DESIGN_INTENT]
+  Overview: <what the board does>
+  - <PartNumber> (<RefDes>): <what the part does in this design>
+  [/DESIGN_INTENT]
+
+Treat this as the authoritative statement of what each part is for. Use it to decide
+how parts connect to each other and which datasheet application circuits apply.
+
 ## Missing datasheets
 
 If your design requires a part whose datasheet was NOT provided in this message,
@@ -154,9 +165,12 @@ def design_step(
     datasheet_texts: dict[str, str],
     kicad_symbols: dict[str, list],
     existing_circuit: dict | None,
+    design_intent: dict | None = None,
 ) -> tuple[dict, str, str]:
     """
     Run one design turn for the given project.
+
+    design_intent: {"overview": str, "parts": [{"mpn", "refdes", "description"}]}
 
     Returns (circuit_dict, circuit_context_md, recreate_prompt_md).
     Raises ValueError on parse failure.
@@ -168,7 +182,7 @@ def design_step(
     client = anthropic.Anthropic(api_key=api_key)
 
     user_message = _build_user_message(
-        user_prompt, datasheet_texts, kicad_symbols, existing_circuit
+        user_prompt, datasheet_texts, kicad_symbols, existing_circuit, design_intent
     )
 
     history = get_history(project_name)
@@ -208,8 +222,20 @@ def _build_user_message(
     datasheet_texts: dict[str, str],
     kicad_symbols: dict[str, list],
     existing_circuit: dict | None,
+    design_intent: dict | None = None,
 ) -> str:
     parts = [user_prompt.strip()]
+
+    if design_intent and (design_intent.get("overview") or design_intent.get("parts")):
+        lines = ["[DESIGN_INTENT]"]
+        if design_intent.get("overview"):
+            lines.append(f"Overview: {design_intent['overview']}")
+        for p in design_intent.get("parts", []):
+            refs = f" ({', '.join(p['refdes'])})" if p.get("refdes") else ""
+            lines.append(f"- {p['mpn']}{refs}: {p['description']}")
+        lines.append("[/DESIGN_INTENT]")
+        parts.append("\n## Design intent (from user)\n")
+        parts.append("\n".join(lines))
 
     if datasheet_texts:
         parts.append("\n## Provided datasheets\n")

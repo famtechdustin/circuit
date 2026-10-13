@@ -6,6 +6,8 @@ services:
     volumes:
       # Circuit project data persists on the host across container rebuilds
       - ./projects:/app/projects
+      # Downloaded KiCad symbol libraries, so they are fetched only once
+      - ./cache:/app/cache
     env_file:
       - .env
     restart: unless-stopped

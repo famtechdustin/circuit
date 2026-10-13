@@ -8,7 +8,9 @@ Or via Docker:
     docker compose up
 """
 
+import asyncio
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -18,8 +20,10 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 
+import bom_importer
 import circuit_designer
 import datasheet_reader
+import eagle_exporter
 import kicad_parser
 import part_finder
 import project_manager
@@ -30,6 +34,15 @@ load_dotenv()
 app = FastAPI(title="Circuit Design Generator")
 templates = Jinja2Templates(directory="templates")
 app.mount("/static", StaticFiles(directory="static"), name="static")
+
+# Concurrent part lookups per request (Mouser calls are throttled separately)
+_FETCH_CONCURRENCY = 4
+
+
+@app.on_event("startup")
+async def _warm_kicad_index():
+    """Start downloading/indexing the KiCad libraries so the first BOM import is fast."""
+    app.state.kicad_index_task = asyncio.create_task(part_finder.ensure_kicad_index())
 
 
 # ---------------------------------------------------------------------------
@@ -52,6 +65,11 @@ class RegenSvgRequest(BaseModel):
 
 class FetchPartsRequest(BaseModel):
     parts: list[str]
+
+
+class PartDescriptionsRequest(BaseModel):
+    overview: str = ""
+    parts: dict[str, str] = {}   # MPN -> what the part does in this design
 
 
 class PromptResponse(BaseModel):
@@ -149,6 +167,7 @@ async def process_prompt(req: PromptRequest):
             datasheet_texts=datasheet_texts,
             kicad_symbols=kicad_data,
             existing_circuit=existing_circuit,
+            design_intent=_design_intent(project),
         )
     except EnvironmentError as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -280,12 +299,65 @@ async def regenerate_svg(project_name: str, req: RegenSvgRequest = RegenSvgReque
     return {"status": "ok"}
 
 
+async def _fetch_part(project: project_manager.Project, part: str) -> dict:
+    """
+    Fetch the datasheet and KiCad symbol for one part and save them:
+      - PDF datasheet  → projects/<name>/datasheets/<part>.pdf
+      - KiCad symbol   → projects/<name>/kicad_symbols/<part>.kicad_sym
+    Files already present in the project are kept and reported as found.
+    """
+    stem = part_finder.safe_filename(part)
+    ds_path = project.datasheets_dir / f"{stem}.pdf"
+    sym_path = project.symbols_dir / f"{stem}.kicad_sym"
+    result = {
+        "part": part,
+        "datasheet": "found", "datasheet_source": "existing", "product_url": "",
+        "symbol": "found", "symbol_match": "",
+    }
+
+    if not ds_path.exists():
+        ds = await part_finder.find_datasheet(part)
+        if ds.pdf:
+            ds_path.write_bytes(ds.pdf)
+        result.update(datasheet=ds.status, datasheet_source=ds.source, product_url=ds.product_url)
+
+    if not sym_path.exists():
+        sym = await part_finder.find_kicad_symbol(part)
+        if sym.text:
+            sym_path.write_text(sym.text, encoding="utf-8")
+        result.update(symbol=sym.status, symbol_match=sym.match)
+
+    result["flagged"] = result["datasheet"] != "found" or result["symbol"] != "found"
+    return result
+
+
+async def _fetch_parts(project: project_manager.Project, parts: list[str]) -> list[dict]:
+    project.datasheets_dir.mkdir(parents=True, exist_ok=True)
+    project.symbols_dir.mkdir(parents=True, exist_ok=True)
+    sem = asyncio.Semaphore(_FETCH_CONCURRENCY)
+
+    async def _one(p: str) -> dict:
+        async with sem:
+            return await _fetch_part(project, p)
+
+    return list(await asyncio.gather(*[_one(p) for p in parts]))
+
+
+def _summarize(rows: list[dict]) -> dict:
+    searched = [r for r in rows if not r.get("generic")]
+    return {
+        "total": len(rows),
+        "searched": len(searched),
+        "flagged": sum(1 for r in searched if r.get("flagged")),
+        "generic": len(rows) - len(searched),
+    }
+
+
 @app.post("/fetch-parts/{project_name}")
 async def fetch_parts(project_name: str, req: FetchPartsRequest):
     """
-    For each part in the list, search public sources and save:
-      - PDF datasheet  → projects/<name>/datasheets/<part>.pdf
-      - KiCad symbol   → projects/<name>/kicad_symbols/<part>.kicad_sym
+    For each part in the list, fetch its datasheet and KiCad symbol into the project.
+    If a BOM report exists, matching rows are updated with the new results.
     Returns per-part results without calling Claude.
     """
     try:
@@ -293,20 +365,125 @@ async def fetch_parts(project_name: str, req: FetchPartsRequest):
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
-    project.symbols_dir.mkdir(parents=True, exist_ok=True)
+    results = await _fetch_parts(project, req.parts)
 
-    async def _fetch_one(p: str) -> dict:
-        ds_bytes, ds_status = await part_finder.find_datasheet(p)
-        sym_text, sym_status = await part_finder.find_kicad_symbol(p)
-        if ds_bytes:
-            (project.datasheets_dir / f"{p}.pdf").write_bytes(ds_bytes)
-        if sym_text:
-            (project.symbols_dir / f"{p}.kicad_sym").write_text(sym_text, encoding="utf-8")
-        return {"part": p, "datasheet": ds_status, "symbol": sym_status}
+    report = project_manager.read_bom_report(project)
+    if report:
+        by_part = {r["part"].upper(): r for r in results}
+        for row in report.get("rows", []):
+            fresh = by_part.get(row["mpn"].upper())
+            if fresh and not row.get("generic"):
+                row.update({k: v for k, v in fresh.items() if k != "part" and v != ""})
+        report["summary"] = _summarize(report.get("rows", []))
+        project_manager.write_bom_report(project, report)
 
-    import asyncio
-    results = await asyncio.gather(*[_fetch_one(p) for p in req.parts])
-    return {"results": list(results)}
+    return {"results": results}
+
+
+@app.post("/import-bom/{project_name}")
+async def import_bom(project_name: str, file: UploadFile = File(...)):
+    """
+    Import a DipTrace BOM CSV, fetch the datasheet and KiCad symbol for every
+    non-generic part, and save the per-part results to bom_report.json.
+    """
+    try:
+        project = project_manager.open_project(project_name)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    raw = await file.read()
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text = raw.decode("cp1252", errors="replace")
+
+    try:
+        bom_rows = bom_importer.parse_diptrace_csv(text)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if not bom_rows:
+        raise HTTPException(status_code=400, detail="No parts found in the BOM.")
+
+    to_fetch = [r.mpn for r in bom_rows if not r.generic]
+    fetched = {r["part"]: r for r in await _fetch_parts(project, to_fetch)}
+
+    rows = []
+    for b in bom_rows:
+        row = b.to_dict()
+        if b.generic:
+            row.update(datasheet="skipped", symbol="skipped", flagged=False)
+        else:
+            row.update({k: v for k, v in fetched[b.mpn].items() if k != "part"})
+        rows.append(row)
+
+    report = {
+        "filename": Path(file.filename or "bom.csv").name,
+        "imported_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "rows": rows,
+        "summary": _summarize(rows),
+    }
+    project_manager.write_bom_report(project, report)
+    return report
+
+
+@app.get("/bom/{project_name}")
+async def get_bom(project_name: str):
+    """Return the last BOM import report for a project."""
+    try:
+        project = project_manager.open_project(project_name)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    report = project_manager.read_bom_report(project)
+    if report is None:
+        raise HTTPException(status_code=404, detail="No BOM imported yet.")
+    return report
+
+
+def _design_intent(project: project_manager.Project) -> dict | None:
+    """Combine saved part descriptions with BOM RefDes for the Claude prompt."""
+    saved = project_manager.read_part_descriptions(project)
+    if not saved:
+        return None
+    report = project_manager.read_bom_report(project) or {}
+    refdes = {r["mpn"].upper(): r.get("refdes", []) for r in report.get("rows", [])}
+    return {
+        "overview": saved.get("overview", ""),
+        "parts": [
+            {"mpn": mpn, "refdes": refdes.get(mpn.upper(), []), "description": desc}
+            for mpn, desc in saved.get("parts", {}).items()
+        ],
+    }
+
+
+@app.get("/part-descriptions/{project_name}")
+async def get_part_descriptions(project_name: str):
+    """Return the saved board overview and per-part descriptions."""
+    try:
+        project = project_manager.open_project(project_name)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    saved = project_manager.read_part_descriptions(project)
+    if saved is None:
+        return {"overview": "", "parts": {}, "saved": False}
+    return {**saved, "saved": True}
+
+
+@app.post("/part-descriptions/{project_name}")
+async def save_part_descriptions(project_name: str, req: PartDescriptionsRequest):
+    """Save the board overview and what each main part does; sent to Claude with every prompt."""
+    try:
+        project = project_manager.open_project(project_name)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    data = {
+        "overview": req.overview.strip(),
+        "parts": {mpn: d.strip() for mpn, d in req.parts.items() if d.strip()},
+    }
+    project_manager.write_part_descriptions(project, data)
+    return data
 
 
 # ---------------------------------------------------------------------------
@@ -410,6 +587,31 @@ async def download_circuit_file(project_name: str):
         path=project.circuit_json_path,
         media_type="application/json",
         filename=f"{project_name}_circuit.json",
+    )
+
+
+@app.get("/download/eagle/{project_name}")
+async def download_eagle(project_name: str):
+    """Serve the circuit as an EAGLE XML schematic for import into DipTrace."""
+    try:
+        project = project_manager.open_project(project_name)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    circuit = project_manager.read_circuit_json(project)
+    if circuit is None:
+        raise HTTPException(status_code=404, detail="No circuit designed yet.")
+
+    report = project_manager.read_bom_report(project) or {}
+    try:
+        sch = eagle_exporter.generate_eagle_sch(circuit, report.get("rows"))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"EAGLE export failed: {e}")
+
+    return Response(
+        content=sch,
+        media_type="application/xml",
+        headers={"Content-Disposition": f'attachment; filename="{project_name}.sch"'},
     )
 
 
