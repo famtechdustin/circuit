@@ -3,11 +3,14 @@ svg_generator.py — Generate a 2D schematic SVG from a circuit JSON dict.
 
 Components are drawn as labeled rectangles with pin stubs on the specified side.
 Nets are drawn as right-angle (Manhattan) wires between pin endpoints.
-Power rails (VCC, GND, etc.) receive standard schematic symbols.
+VCC-type power rails are drawn as horizontal buses; GND nets use a local
+ground symbol at each connected pin (no shared ground bar).
 """
 
+import colorsys
 import copy
 import io
+import re
 import svgwrite
 from svgwrite import cm, mm
 
@@ -20,10 +23,10 @@ PIN_FONT = 8
 COMP_FILL = "#eef2ff"
 COMP_STROKE = "#334466"
 COMP_STROKE_W = 1.5
-WIRE_STROKE = "#1a4fa0"
 WIRE_W = 1.5
-POWER_STROKE = "#cc2200"
-GND_STROKE = "#222222"
+# Defaults kept for fallbacks / mid anchors
+POWER_STROKE = "#cc2200"   # ~5V mid red
+GND_STROKE = "#222222"     # primary GND
 NET_LABEL_FILL = "#ffffff"
 NET_LABEL_STROKE = "#888888"
 GRID = 10
@@ -35,20 +38,499 @@ MIN_COMP_H = 90     # minimum rendered component height (3 text zones)
 # Clearance added around each component body when checking for overlaps.
 # Must cover pin stubs (PIN_STUB) + max lane exit (MAX_LANES * LANE_STEP) + routing room.
 COMP_PADDING = PIN_STUB + MAX_LANES * LANE_STEP + 20   # ≈ 118 px
+BODY_PAD = 6        # px margin around component bodies that wires must not cross
+ROUTE_PASSES = 3    # post-layout clearance / reroute iterations
 RAIL_TOP_START = 35          # Y of topmost VCC-type rail
 RAIL_BOT_START = CANVAS_H - 35  # Y of bottommost GND-type rail
 RAIL_SPACING = 22            # px between stacked rails of same polarity
+SUPPORT_GAP = 50             # px from host pin tip to nearest edge of support body
+SUPPORT_STACK_PAD = 20       # px between stacked supports on the same pin
 
-_GND_NAMES = {"GND", "AGND", "DGND", "PGND", "0V"}
+SIGNAL_PALETTE_SIZE = 20
+SIGNAL_PALETTE_OFFSET = 7    # shift on each 20-pin cycle (pins 21–40, …)
+
+_GND_NAMES = {"GND", "AGND", "DGND", "PGND", "0V", "ISO_GND"}
+_GND_STROKES = {
+    "GND": "#222222",
+    "0V": "#222222",
+    "PGND": "#3a3a3a",
+    "DGND": "#555555",
+    "AGND": "#6e6e6e",
+    "ISO_GND": "#999999",
+}
+_PASSIVE_TYPE_TOKENS = ("resistor", "capacitor", "cap", "bypass")
+_OPPOSITE_SIDE = {"left": "right", "right": "left", "top": "bottom", "bottom": "top"}
+
+# Voltage tokens: "3V3", "3.3V", "12V", optional leading digits in names like "MCU_5V"
+_VOLTAGE_RE = re.compile(
+    r"(?:(?P<a>\d+)V(?P<b>\d+)\b)|(?:(?P<c>\d+(?:\.\d+)?)\s*V\b)",
+    re.IGNORECASE,
+)
+
+
+def _hsl_to_hex(h: float, s: float, lightness: float) -> str:
+    """h in degrees [0,360), s/l in [0,1] → #rrggbb."""
+    r, g, b = colorsys.hls_to_rgb(h / 360.0, lightness, s)
+    return f"#{int(r * 255 + 0.5):02x}{int(g * 255 + 0.5):02x}{int(b * 255 + 0.5):02x}"
+
+
+def _build_signal_palette(n: int = SIGNAL_PALETTE_SIZE) -> list[str]:
+    """n hues spaced across the gamut, skipping the red band used for power."""
+    # Hue range ~35°–330° avoids near-red and stays saturated (not gray).
+    if n <= 1:
+        return [_hsl_to_hex(210, 0.75, 0.42)]
+    lo, hi = 35.0, 330.0
+    return [
+        _hsl_to_hex(lo + i * (hi - lo) / (n - 1), 0.78, 0.42)
+        for i in range(n)
+    ]
+
+
+SIGNAL_PALETTE = _build_signal_palette()
+WIRE_STROKE = SIGNAL_PALETTE[0]  # legacy alias: first signal color
 
 
 def _is_gnd_net(name: str) -> bool:
-    return name.upper() in _GND_NAMES
+    u = (name or "").upper().strip()
+    if not u:
+        return False
+    if u in _GND_NAMES:
+        return True
+    return u.endswith("_GND")
+
+
+def _gnd_stroke(name: str) -> str:
+    """Gray shade for ground nets — darkest for primary GND, lighter for ISO/etc."""
+    u = (name or "").upper().strip()
+    return _GND_STROKES.get(u, "#999999")
+
+
+def _parse_voltage(name: str) -> float | None:
+    """Extract volts from a rail name (12V, 5V, 3V3, 3.3V). None if unknown."""
+    if not name:
+        return None
+    m = _VOLTAGE_RE.search(name)
+    if not m:
+        return None
+    if m.group("a") is not None:
+        return float(f"{m.group('a')}.{m.group('b')}")
+    return float(m.group("c"))
+
+
+def _power_stroke(name: str) -> str:
+    """Red shade for power rails — darker red for higher voltage."""
+    v = _parse_voltage(name)
+    if v is None:
+        return POWER_STROKE
+    # Anchor band: 3V light → 5V mid → 12V dark (clamp outside)
+    t = max(0.0, min(1.0, (v - 3.0) / 9.0))
+    lightness = 0.55 - t * 0.32  # ~0.55 at 3V, ~0.48 at 5V, ~0.23 at 12V
+    return _hsl_to_hex(0.0, 0.92, lightness)
+
+
+def _signal_stroke(pin_number: int) -> str:
+    """Signal color from pin index; cycles every 20 pins with a palette offset."""
+    i = max(0, int(pin_number) - 1)
+    slot = (i % SIGNAL_PALETTE_SIZE + (i // SIGNAL_PALETTE_SIZE) * SIGNAL_PALETTE_OFFSET) % SIGNAL_PALETTE_SIZE
+    return SIGNAL_PALETTE[slot]
+
+
+def _as_pin_int(value) -> int | None:
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _representative_pin(connections: list, pin_counts: dict[str, int]) -> int:
+    """Pick a pin number for signal coloring: prefer the largest attached IC."""
+    best: tuple[int, int] | None = None  # (pin_count, pin_number)
+    fallback: list[int] = []
+    for conn in connections or []:
+        pn = _as_pin_int(conn.get("pin_number"))
+        if pn is None:
+            continue
+        fallback.append(pn)
+        cid = str(conn.get("component_id", "")).strip()
+        n_pins = pin_counts.get(cid, 0)
+        if best is None or n_pins > best[0] or (n_pins == best[0] and pn < best[1]):
+            best = (n_pins, pn)
+    if best is not None:
+        return best[1]
+    return min(fallback) if fallback else 1
 
 
 def _eff_h(comp: dict) -> float:
     """Effective component height — enforces MIN_COMP_H regardless of JSON value."""
     return max(float(comp["bounding_box"]["height"]), MIN_COMP_H)
+
+
+def _is_passive_type(comp: dict) -> bool:
+    t = (comp.get("type") or "").lower()
+    return any(tok in t for tok in _PASSIVE_TYPE_TOKENS)
+
+
+def _is_multi_pin_host(comp: dict) -> bool:
+    """ICs and other primary parts (3+ pins) that support parts attach to."""
+    return len(comp.get("pins") or []) >= 3
+
+
+def _opposite_side(side: str) -> str:
+    return _OPPOSITE_SIDE.get(side, "right")
+
+
+def _pin_net_map(nets: list) -> dict[tuple[str, str], str]:
+    """(component_id, pin_number_str) -> net name."""
+    out: dict[tuple[str, str], str] = {}
+    for net in nets or []:
+        name = net.get("name") or ""
+        for conn in net.get("connections") or []:
+            cid = str(conn.get("component_id", "")).strip()
+            pn = str(conn.get("pin_number", "")).strip()
+            if cid and pn:
+                out[(cid, pn)] = name
+    return out
+
+
+def _net_members(nets: list) -> dict[str, list[tuple[str, str]]]:
+    """net name -> [(component_id, pin_number_str), ...]."""
+    out: dict[str, list[tuple[str, str]]] = {}
+    for net in nets or []:
+        name = net.get("name") or ""
+        if not name:
+            continue
+        members = out.setdefault(name, [])
+        for conn in net.get("connections") or []:
+            cid = str(conn.get("component_id", "")).strip()
+            pn = str(conn.get("pin_number", "")).strip()
+            if cid and pn:
+                members.append((cid, pn))
+    return out
+
+
+def _coerce_pin_number(host_id: str, pin_number, by_id: dict[str, dict]):
+    """Return pin_number typed like the host's pin.number (int if possible)."""
+    host = by_id.get(host_id) or {}
+    target = str(pin_number).strip()
+    for hp in host.get("pins") or []:
+        if str(hp.get("number", "")).strip() == target:
+            return hp.get("number")
+    try:
+        return int(target)
+    except (TypeError, ValueError):
+        return pin_number
+
+
+def _infer_supports(
+    comp: dict,
+    by_id: dict[str, dict],
+    pin_nets: dict[tuple[str, str], str],
+    net_members: dict[str, list[tuple[str, str]]],
+    power_rails: set[str],
+) -> dict | None:
+    """
+    Infer supports for a 2-pin passive: one net touches a multi-pin host pin;
+    prefer a unique host pin, else a non-rail / power_in candidate.
+    """
+    pins = comp.get("pins") or []
+    if len(pins) != 2:
+        return None
+    cid = str(comp.get("id", "")).strip()
+    if not cid:
+        return None
+
+    candidates: list[tuple[str, str, str]] = []
+    for pin in pins:
+        pn = str(pin.get("number", "")).strip()
+        net_name = pin_nets.get((cid, pn))
+        if not net_name:
+            continue
+        for other_cid, other_pn in net_members.get(net_name, []):
+            if other_cid == cid:
+                continue
+            host = by_id.get(other_cid)
+            if host and _is_multi_pin_host(host):
+                candidates.append((other_cid, other_pn, net_name))
+
+    uniq: dict[tuple[str, str], str] = {}
+    for hid, hpn, nname in candidates:
+        uniq.setdefault((hid, hpn), nname)
+    if not uniq:
+        return None
+
+    def _is_railish(n: str) -> bool:
+        return n in power_rails or _is_gnd_net(n)
+
+    if len(uniq) == 1:
+        (hid, hpn), _nname = next(iter(uniq.items()))
+        return {"component_id": hid, "pin_number": _coerce_pin_number(hid, hpn, by_id)}
+
+    scored: list[tuple[int, str, str]] = []
+    for (hid, hpn), nname in uniq.items():
+        score = 0
+        if not _is_railish(nname):
+            score += 2
+        host = by_id.get(hid) or {}
+        for hp in host.get("pins") or []:
+            if str(hp.get("number", "")).strip() == str(hpn).strip():
+                if (hp.get("direction") or "").lower() in (
+                    "power_in", "input", "bidirectional",
+                ):
+                    score += 1
+                break
+        scored.append((score, hid, hpn))
+    scored.sort(key=lambda t: -t[0])
+    _, hid, hpn = scored[0]
+    return {"component_id": hid, "pin_number": _coerce_pin_number(hid, hpn, by_id)}
+
+
+def _facing_support_pin(
+    support: dict,
+    host_id: str,
+    host_pin_number,
+    pin_nets: dict[tuple[str, str], str],
+    net_members: dict[str, list[tuple[str, str]]],
+) -> dict | None:
+    """Which support pin shares a net with the host pin being supported."""
+    sid = str(support.get("id", "")).strip()
+    host_net = pin_nets.get((host_id, str(host_pin_number).strip()))
+    pins = support.get("pins") or []
+    if host_net:
+        for pin in pins:
+            pn = str(pin.get("number", "")).strip()
+            if pin_nets.get((sid, pn)) == host_net:
+                return pin
+    for pin in pins:
+        pn = str(pin.get("number", "")).strip()
+        nname = pin_nets.get((sid, pn))
+        if not nname:
+            continue
+        for c, p in net_members.get(nname, []):
+            if c == host_id and str(p) == str(host_pin_number).strip():
+                return pin
+    return pins[0] if pins else None
+
+
+def _orient_support_pins(
+    support: dict,
+    host_side: str,
+    facing_pin: dict | None,
+) -> None:
+    """Face the host-net pin toward the host; other pin outward."""
+    facing_side = _opposite_side(host_side)
+    outward_side = host_side
+    facing_num = str((facing_pin or {}).get("number", "")).strip()
+    for pin in support.get("pins") or []:
+        if facing_num and str(pin.get("number", "")).strip() == facing_num:
+            pin["side"] = facing_side
+            pin["offset"] = 0.5
+        else:
+            pin["side"] = outward_side
+            pin["offset"] = 0.5
+
+
+def _seat_support_at_pin(
+    support: dict,
+    host: dict,
+    host_pin: dict,
+    stack_index: int,
+) -> None:
+    """Place support body just outside the host pin tip, stacked along outward axis."""
+    tip_x, tip_y = _pin_endpoint(host, host_pin)
+    sw = float(support["bounding_box"]["width"])
+    sh = _eff_h(support)
+    side = host_pin.get("side", "left")
+    step = max(sw, sh) + SUPPORT_STACK_PAD
+    gap = SUPPORT_GAP + stack_index * step
+
+    if side == "left":
+        x = tip_x - gap - sw
+        y = tip_y - sh / 2
+    elif side == "right":
+        x = tip_x + gap
+        y = tip_y - sh / 2
+    elif side == "top":
+        x = tip_x - sw / 2
+        y = tip_y - gap - sh
+    else:
+        x = tip_x - sw / 2
+        y = tip_y + gap
+
+    support.setdefault("position", {})
+    support["position"]["x"] = x
+    support["position"]["y"] = y
+
+
+def place_support_parts(
+    components: list,
+    nets: list,
+    power_rails: set[str] | None = None,
+) -> set[frozenset]:
+    """
+    Place decoupling/pull-up style support parts next to the host pin they serve.
+
+    Uses component["supports"] when present; otherwise infers for 2-pin passives.
+    Mutates components in place. Returns bonded pairs as frozensets of ids.
+    """
+    power_rails = set(power_rails or [])
+    by_id = {str(c.get("id", "")).strip(): c for c in components if c.get("id")}
+    pin_nets = _pin_net_map(nets)
+    members = _net_members(nets)
+    bonded: set[frozenset] = set()
+
+    bindings: list[tuple[dict, str, object]] = []
+    for comp in components:
+        cid = str(comp.get("id", "")).strip()
+        if not cid:
+            continue
+        supports = comp.get("supports")
+        if isinstance(supports, dict) and supports.get("component_id") is not None:
+            hid = str(supports.get("component_id", "")).strip()
+            hpn = supports.get("pin_number")
+            if hid in by_id and hpn is not None:
+                bindings.append((comp, hid, hpn))
+            continue
+        if not _is_passive_type(comp):
+            continue
+        if len(comp.get("pins") or []) != 2:
+            continue
+        inferred = _infer_supports(comp, by_id, pin_nets, members, power_rails)
+        if inferred:
+            comp["supports"] = inferred
+            bindings.append((comp, inferred["component_id"], inferred["pin_number"]))
+
+    groups: dict[tuple[str, str], list[dict]] = {}
+    for support, hid, hpn in bindings:
+        key = (hid, str(hpn).strip())
+        groups.setdefault(key, []).append(support)
+        bonded.add(frozenset({str(support.get("id", "")).strip(), hid}))
+
+    for (hid, hpn_str), supports in groups.items():
+        host = by_id.get(hid)
+        if not host:
+            continue
+        host_pin = None
+        for hp in host.get("pins") or []:
+            if str(hp.get("number", "")).strip() == hpn_str:
+                host_pin = hp
+                break
+        if not host_pin:
+            continue
+        host_side = host_pin.get("side", "left")
+
+        def _stack_key(s: dict):
+            val = (s.get("value") or "").lower()
+            bulk = 1 if ("uf" in val or "µf" in val) else 0
+            return (bulk, str(s.get("id", "")))
+
+        for stack_i, support in enumerate(sorted(supports, key=_stack_key)):
+            facing = _facing_support_pin(
+                support, hid, host_pin.get("number"), pin_nets, members,
+            )
+            _orient_support_pins(support, host_side, facing)
+            _seat_support_at_pin(support, host, host_pin, stack_i)
+
+    return bonded
+
+
+def _support_host_maps(
+    components: list,
+) -> tuple[dict[str, str], dict[str, list[dict]], dict[str, dict]]:
+    """support_id -> host_id, host_id -> [support comps], id -> comp."""
+    by_id = {str(c.get("id", "")).strip(): c for c in components if c.get("id")}
+    support_of: dict[str, str] = {}
+    for c in components:
+        sid = str(c.get("id", "")).strip()
+        supports = c.get("supports")
+        if not sid or not isinstance(supports, dict):
+            continue
+        hid = str(supports.get("component_id", "")).strip()
+        if hid and hid in by_id:
+            support_of[sid] = hid
+    hosts_supports: dict[str, list[dict]] = {}
+    for sid, hid in support_of.items():
+        hosts_supports.setdefault(hid, []).append(by_id[sid])
+    return support_of, hosts_supports, by_id
+
+
+def _cluster_member_ids(
+    cid: str,
+    support_of: dict[str, str],
+    hosts_supports: dict[str, list[dict]],
+) -> set[str]:
+    host_id = support_of.get(cid, cid)
+    ids = {host_id}
+    for s in hosts_supports.get(host_id, []):
+        ids.add(str(s.get("id", "")).strip())
+    return ids
+
+
+# ---------------------------------------------------------------------------
+# Geometry helpers — component bodies as wire obstacles
+# ---------------------------------------------------------------------------
+
+_Rect = tuple[float, float, float, float]  # x1, y1, x2, y2
+_PtF = tuple[float, float]
+
+
+def _comp_body_rect(comp: dict, pad: float = BODY_PAD) -> _Rect:
+    """Axis-aligned component body expanded by ``pad`` (wires must stay outside)."""
+    x = float(comp["position"]["x"])
+    y = float(comp["position"]["y"])
+    w = float(comp["bounding_box"]["width"])
+    h = _eff_h(comp)
+    return (x - pad, y - pad, x + w + pad, y + h + pad)
+
+
+def _obstacles_for_net(components: list, attached_ids: set[str]) -> list[_Rect]:
+    """Bodies of components this net does not attach to."""
+    return [
+        _comp_body_rect(c)
+        for c in components
+        if str(c.get("id", "")) not in attached_ids
+    ]
+
+
+def _h_hits_rect(y: float, x1: float, x2: float, rect: _Rect) -> bool:
+    rx1, ry1, rx2, ry2 = rect
+    if y <= ry1 or y >= ry2:
+        return False
+    xmin, xmax = min(x1, x2), max(x1, x2)
+    return xmax > rx1 and xmin < rx2
+
+
+def _v_hits_rect(x: float, y1: float, y2: float, rect: _Rect) -> bool:
+    rx1, ry1, rx2, ry2 = rect
+    if x <= rx1 or x >= rx2:
+        return False
+    ymin, ymax = min(y1, y2), max(y1, y2)
+    return ymax > ry1 and ymin < ry2
+
+
+def _seg_hits_obstacles(
+    a: _PtF, b: _PtF, obstacles: list[_Rect], tol: float = SEG_TOL,
+) -> bool:
+    x1, y1 = a
+    x2, y2 = b
+    if abs(y1 - y2) < tol:  # horizontal
+        return any(_h_hits_rect(y1, x1, x2, r) for r in obstacles)
+    if abs(x1 - x2) < tol:  # vertical
+        return any(_v_hits_rect(x1, y1, y2, r) for r in obstacles)
+    # Non-Manhattan: treat as H then V
+    mid = (x2, y1)
+    return (
+        _seg_hits_obstacles(a, mid, obstacles, tol)
+        or _seg_hits_obstacles(mid, b, obstacles, tol)
+    )
+
+
+def _path_hits_obstacles(
+    pts: list[_PtF], obstacles: list[_Rect], tol: float = SEG_TOL,
+) -> bool:
+    for i in range(len(pts) - 1):
+        if _seg_hits_obstacles(pts[i], pts[i + 1], obstacles, tol):
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -59,6 +541,7 @@ class _SegmentRegistry:
     """
     Keeps a list of horizontal and vertical wire segments already drawn.
     Used to detect overlapping routes and choose an offset bend point.
+    Optionally refuses paths that cross component-body obstacles.
     """
 
     def __init__(self, tol: float = SEG_TOL):
@@ -94,54 +577,135 @@ class _SegmentRegistry:
         if abs(y2 - y1) >= self._tol:
             self._v.append((x, min(y1, y2), max(y1, y2)))
 
+    def register_path(self, pts: list[_PtF]) -> None:
+        for i in range(len(pts) - 1):
+            x1, y1 = pts[i]
+            x2, y2 = pts[i + 1]
+            if abs(y1 - y2) < self._tol:
+                self.register_h(y1, x1, x2)
+            elif abs(x1 - x2) < self._tol:
+                self.register_v(x1, y1, y2)
+            else:
+                self.register_h(y1, x1, x2)
+                self.register_v(x2, y1, y2)
+
+    def _wire_conflict_path(self, pts: list[_PtF]) -> bool:
+        for i in range(len(pts) - 1):
+            x1, y1 = pts[i]
+            x2, y2 = pts[i + 1]
+            if abs(y1 - y2) < self._tol:
+                if self._h_conflict(y1, x1, x2):
+                    return True
+            elif abs(x1 - x2) < self._tol:
+                if self._v_conflict(x1, y1, y2):
+                    return True
+            else:
+                if self._h_conflict(y1, x1, x2) or self._v_conflict(x2, y1, y2):
+                    return True
+        return False
+
+    def path_ok(self, pts: list[_PtF], obstacles: list[_Rect] | None = None) -> bool:
+        if obstacles and _path_hits_obstacles(pts, obstacles, self._tol):
+            return False
+        return not self._wire_conflict_path(pts)
+
     def route(
         self,
         p1: tuple[float, float],
         p2: tuple[float, float],
         max_tries: int = 9,
+        obstacles: list[_Rect] | None = None,
     ) -> list[tuple[float, float]]:
         """
-        Return an L-shaped waypoint list from p1 to p2, shifting the bend
-        point horizontally until no registered segment conflicts are found.
-        Registers the chosen segments before returning.
+        Return a Manhattan waypoint list from p1 to p2 that avoids registered
+        wire segments and optional component-body obstacles. Tries H-then-V
+        L-bends, V-then-H L-bends, and U-detours. Registers the chosen path.
         """
+        obstacles = obstacles or []
         x1, y1 = p1
         x2, y2 = p2
 
-        # Pure horizontal
+        def accept(pts: list[_PtF]) -> list[_PtF] | None:
+            # Collapse consecutive duplicates
+            cleaned: list[_PtF] = [pts[0]]
+            for p in pts[1:]:
+                if abs(p[0] - cleaned[-1][0]) >= self._tol or abs(p[1] - cleaned[-1][1]) >= self._tol:
+                    cleaned.append(p)
+            if len(cleaned) < 2:
+                cleaned = [p1, p2]
+            if self.path_ok(cleaned, obstacles):
+                self.register_path(cleaned)
+                return cleaned
+            return None
+
+        # Pure horizontal / vertical — detour if blocked
         if abs(y1 - y2) < self.tol:
+            got = accept([p1, p2])
+            if got:
+                return got
+            for k in range(1, max_tries + 1):
+                for sign in (1, -1):
+                    my = y1 + sign * k * WIRE_SPACING
+                    got = accept([p1, (x1, my), (x2, my), p2])
+                    if got:
+                        return got
             self.register_h(y1, x1, x2)
             return [p1, p2]
 
-        # Pure vertical
         if abs(x1 - x2) < self.tol:
+            got = accept([p1, p2])
+            if got:
+                return got
+            for k in range(1, max_tries + 1):
+                for sign in (1, -1):
+                    mx = x1 + sign * k * WIRE_SPACING
+                    got = accept([p1, (mx, y1), (mx, y2), p2])
+                    if got:
+                        return got
             self.register_v(x1, y1, y2)
             return [p1, p2]
 
-        # General: try offsets of the mid-x bend point
-        base_mid = (x1 + x2) / 2
         offsets = [0]
         for k in range(1, max_tries):
-            offsets.append( k * WIRE_SPACING)
+            offsets.append(k * WIRE_SPACING)
             offsets.append(-k * WIRE_SPACING)
 
+        base_mx = (x1 + x2) / 2
+        base_my = (y1 + y2) / 2
+
+        # H-V-H via mid-x, then V-H-V via mid-y
         for off in offsets:
-            mx = base_mid + off
-            if (not self._h_conflict(y1, x1, mx) and
-                    not self._v_conflict(mx, y1, y2) and
-                    not self._h_conflict(y2, mx, x2)):
-                self.register_h(y1, x1, mx)
-                self.register_v(mx, y1, y2)
-                self.register_h(y2, mx, x2)
-                return [p1, (mx, y1), (mx, y2), p2]
+            mx = base_mx + off
+            got = accept([p1, (mx, y1), (mx, y2), p2])
+            if got:
+                return got
+            my = base_my + off
+            got = accept([p1, (x1, my), (x2, my), p2])
+            if got:
+                return got
 
-        # Fallback: use base mid even if conflicted (draws on top — rare)
-        self.register_h(y1, x1, base_mid)
-        self.register_v(base_mid, y1, y2)
-        self.register_h(y2, base_mid, x2)
-        return [p1, (base_mid, y1), (base_mid, y2), p2]
+        # U-detours: go around above/below/left/right of the bounding box of endpoints
+        for k in range(1, max_tries + 1):
+            d = k * WIRE_SPACING
+            top = min(y1, y2) - d
+            bot = max(y1, y2) + d
+            left = min(x1, x2) - d
+            right = max(x1, x2) + d
+            for pts in (
+                [p1, (x1, top), (x2, top), p2],
+                [p1, (x1, bot), (x2, bot), p2],
+                [p1, (left, y1), (left, y2), p2],
+                [p1, (right, y1), (right, y2), p2],
+            ):
+                got = accept(pts)
+                if got:
+                    return got
 
-    # expose tol as property for the pure-H/V checks above
+        # Fallback: base mid even if conflicted
+        fallback = [p1, (base_mx, y1), (base_mx, y2), p2]
+        self.register_path(fallback)
+        return fallback
+
     @property
     def tol(self) -> float:
         return self._tol
@@ -157,13 +721,12 @@ def generate_svg(circuit: dict, min_w: int | None = None, min_h: int | None = No
     """
     # ── Layout computation (all of this must happen before SVG creation) ──────
     components = copy.deepcopy(circuit.get("components", []))
-    _resolve_overlaps(components)
-
     nets        = circuit.get("nets", [])
     power_rails = set(circuit.get("power_rails", []))
+    bonded = place_support_parts(components, nets, power_rails)
+    _resolve_overlaps(components, bonded_pairs=bonded)
 
     vcc_nets = sorted(n for n in power_rails if not _is_gnd_net(n))
-    gnd_nets = sorted(n for n in power_rails if _is_gnd_net(n))
 
     # Shift every component so the layout clears the top/left margins
     top_margin = RAIL_TOP_START + max(1, len(vcc_nets)) * RAIL_SPACING + 50
@@ -178,18 +741,16 @@ def generate_svg(circuit: dict, min_w: int | None = None, min_h: int | None = No
     else:
         _cw, _ch = CANVAS_W, CANVAS_H
     canvas_w = max(CANVAS_W, int(_cw) + 10)
-    canvas_h = max(CANVAS_H, int(_ch) + 60)  # +60 for GND rail + title row
+    canvas_h = max(CANVAS_H, int(_ch) + 40)  # +40 for title row
     if min_w:
         canvas_w = max(canvas_w, min_w)
     if min_h:
         canvas_h = max(canvas_h, min_h)
 
-    # Assign rail Y positions using the real canvas height for GND
+    # VCC-type rails only — GND uses local symbols at each pin
     rail_y: dict[str, float] = {}
     for i, n in enumerate(vcc_nets):
         rail_y[n] = RAIL_TOP_START + i * RAIL_SPACING
-    for i, n in enumerate(gnd_nets):
-        rail_y[n] = canvas_h - RAIL_TOP_START - i * RAIL_SPACING
 
     # ── SVG creation ─────────────────────────────────────────────────────────
     dwg = svgwrite.Drawing(
@@ -210,81 +771,89 @@ def generate_svg(circuit: dict, min_w: int | None = None, min_h: int | None = No
     # Build pin lookups:
     #   pin_endpoints  — stub tip (the visible pin end)
     #   pin_lane_exits — further out by (pin_idx+1)*LANE_STEP, one unique lane per pin
+    #   pin_sides      — pin side for orienting local power symbols
     pin_endpoints:   dict[tuple, tuple[float, float]] = {}
     pin_lane_exits:  dict[tuple, tuple[float, float]] = {}
+    pin_sides:       dict[tuple, str] = {}
+    pin_counts:      dict[str, int] = {}
     for comp in components:
-        for pin_idx, pin in enumerate(comp.get("pins", [])):
+        cid = str(comp.get("id", "")).strip()
+        pins = comp.get("pins", []) or []
+        if cid:
+            pin_counts[cid] = len(pins)
+        for pin_idx, pin in enumerate(pins):
             key = (comp["id"], pin["number"])
             pin_endpoints[key]  = _pin_endpoint(comp, pin)
             pin_lane_exits[key] = _pin_lane_exit(comp, pin, pin_idx)
-
-    # Pre-register all stub→lane segments so the mid-router avoids them
-    registry = _SegmentRegistry()
-    for comp in components:
-        for pin_idx, pin in enumerate(comp.get("pins", [])):
-            key  = (comp["id"], pin["number"])
-            tip  = pin_endpoints[key]
-            lane = pin_lane_exits[key]
-            side = pin.get("side", "left")
-            if side in {"left", "right"}:
-                registry.register_h(tip[1], tip[0], lane[0])
-            else:
-                registry.register_v(tip[0], tip[1], lane[1])
+            pin_sides[key] = pin.get("side", "left")
 
     wire_group      = dwg.add(dwg.g(id="wires"))
     net_label_group = dwg.add(dwg.g(id="net-labels"))
+
+    # Power nets first (buses / local GND), then multi-pass signal routing
+    signal_jobs: list[dict] = []
 
     for net in nets:
         name        = net.get("name", "")
         connections = net.get("connections", [])
         is_power    = name in power_rails
 
-        # Collect (tip, lane_exit) pairs for each connection
-        conn_pts: list[tuple[tuple, tuple]] = []
+        # Collect (tip, lane_exit, side) for each connection
+        conn_pts: list[tuple[tuple, tuple, str]] = []
+        attached: set[str] = set()
         for conn in connections:
-            key = (conn.get("component_id", ""), conn.get("pin_number", -1))
+            cid = conn.get("component_id", "")
+            key = (cid, conn.get("pin_number", -1))
             tip  = pin_endpoints.get(key)
             lane = pin_lane_exits.get(key, tip)
+            side = pin_sides.get(key, "left")
             if tip:
-                conn_pts.append((tip, lane))
+                conn_pts.append((tip, lane, side))
+                if cid:
+                    attached.add(str(cid))
 
-        stroke = (
-            POWER_STROKE if is_power and name.upper() not in {"GND", "AGND", "DGND"}
-            else GND_STROKE if name.upper() in {"GND", "AGND", "DGND"}
-            else WIRE_STROKE
-        )
+        if is_power and not _is_gnd_net(name):
+            stroke = _power_stroke(name)
+        elif _is_gnd_net(name):
+            stroke = _gnd_stroke(name)
+        else:
+            stroke = _signal_stroke(_representative_pin(connections, pin_counts))
 
-        # Power rails: horizontal bus + vertical stubs
+        # Power: GND gets a local symbol at each pin; VCC-type rails use a bus
         if is_power:
-            ry = rail_y.get(name)
-            if ry is not None and conn_pts:
-                _draw_power_bus(dwg, wire_group, net_label_group,
-                                registry, conn_pts, name, ry, stroke)
+            # Dedicated registry so power buses don't starve signal clearance
+            # — still register into a throwaway that we discard after drawing.
+            preg = _SegmentRegistry()
+            if _is_gnd_net(name):
+                for tip, _, side in conn_pts:
+                    _draw_power_symbol(dwg, wire_group, name, tip[0], tip[1], side)
             else:
-                for tip, _ in conn_pts:
-                    _draw_power_symbol(dwg, wire_group, name, tip[0], tip[1])
+                ry = rail_y.get(name)
+                bus_pts = [(tip, lane) for tip, lane, _ in conn_pts]
+                if ry is not None and bus_pts:
+                    _draw_power_bus(dwg, wire_group, net_label_group,
+                                    preg, bus_pts, name, ry, stroke)
+                else:
+                    for tip, _, side in conn_pts:
+                        _draw_power_symbol(dwg, wire_group, name, tip[0], tip[1], side)
             continue
 
         if len(conn_pts) < 2:
             continue
 
-        if len(conn_pts) == 2:
-            # Two endpoints: single L-shaped route
-            tip1, lane1 = conn_pts[0]
-            tip2, lane2 = conn_pts[1]
-            mid = registry.route(lane1, lane2)
-            wire_group.add(dwg.polyline(
-                points=[tip1] + mid + [tip2],
-                stroke=stroke, stroke_width=WIRE_W, fill="none",
-                stroke_linejoin="round", stroke_linecap="round",
-            ))
-            _draw_net_label(dwg, net_label_group, name,
-                            *_midpoint(lane1, lane2))
-        else:
-            # Three or more endpoints: horizontal trunk with vertical stubs
-            _draw_trunk_net(dwg, wire_group, net_label_group,
-                            registry, conn_pts, stroke, name)
+        signal_jobs.append({
+            "name": name,
+            "stroke": stroke,
+            "attached": attached,
+            "conn_pts": [(tip, lane) for tip, lane, _ in conn_pts],
+        })
 
+    # Post-layout clearance: route signal nets up to ROUTE_PASSES times so
+    # traces avoid foreign component bodies and each other.
+    routed = _multi_pass_route_signals(components, signal_jobs, pin_endpoints, pin_lane_exits)
+
+    for job, geom in zip(signal_jobs, routed):
+        _draw_routed_net(dwg, wire_group, net_label_group, job, geom)
     # Draw components on top of wires
     comp_group = dwg.add(dwg.g(id="components"))
     for comp in components:
@@ -306,16 +875,29 @@ def generate_svg(circuit: dict, min_w: int | None = None, min_h: int | None = No
     return buf.getvalue()
 
 
-def _resolve_overlaps(components: list, max_iter: int = 60) -> None:
+def _resolve_overlaps(
+    components: list,
+    max_iter: int = 60,
+    bonded_pairs: set[frozenset] | None = None,
+) -> None:
     """
     Iteratively push overlapping component boxes apart (in-place).
 
     Each component is treated as a rectangle expanded by COMP_PADDING on all
     sides to account for pin stubs, lane exits, and routing clearance.
-    On each pass all pairs are checked; overlapping pairs are nudged apart
-    in whichever axis requires the smaller displacement.  Repeats until no
-    pair overlaps or max_iter is reached.
+    Host–support bonded pairs are not pushed apart; when either moves against
+    an unrelated part, the whole host+supports cluster moves together.
     """
+    bonded = bonded_pairs or set()
+    support_of, hosts_supports, by_id = _support_host_maps(components)
+
+    def _move_ids(ids: set[str], dx: float, dy: float) -> None:
+        for mid in ids:
+            m = by_id.get(mid)
+            if m is not None:
+                m["position"]["x"] += dx
+                m["position"]["y"] += dy
+
     for _ in range(max_iter):
         any_moved = False
 
@@ -323,6 +905,16 @@ def _resolve_overlaps(components: list, max_iter: int = 60) -> None:
             for j in range(i + 1, len(components)):
                 ci = components[i]
                 cj = components[j]
+                id_i = str(ci.get("id", "")).strip()
+                id_j = str(cj.get("id", "")).strip()
+
+                if id_i and id_j and frozenset({id_i, id_j}) in bonded:
+                    continue
+
+                cluster_i = _cluster_member_ids(id_i, support_of, hosts_supports)
+                cluster_j = _cluster_member_ids(id_j, support_of, hosts_supports)
+                if cluster_i & cluster_j:
+                    continue
 
                 xi = ci["position"]["x"];  yi = ci["position"]["y"]
                 wi = ci["bounding_box"]["width"];  hi = _eff_h(ci)
@@ -341,23 +933,23 @@ def _resolve_overlaps(components: list, max_iter: int = 60) -> None:
                 if ox <= 0 or oy <= 0:
                     continue   # already clear
 
-                # Push in the direction of smaller overlap to minimise movement
+                # Push clusters in the direction of smaller overlap
                 if ox <= oy:
                     half = ox / 2 + 1
                     if (xi + wi / 2) <= (xj + wj / 2):
-                        ci["position"]["x"] -= half
-                        cj["position"]["x"] += half
+                        _move_ids(cluster_i, -half, 0)
+                        _move_ids(cluster_j, half, 0)
                     else:
-                        ci["position"]["x"] += half
-                        cj["position"]["x"] -= half
+                        _move_ids(cluster_i, half, 0)
+                        _move_ids(cluster_j, -half, 0)
                 else:
                     half = oy / 2 + 1
                     if (yi + hi / 2) <= (yj + hj / 2):
-                        ci["position"]["y"] -= half
-                        cj["position"]["y"] += half
+                        _move_ids(cluster_i, 0, -half)
+                        _move_ids(cluster_j, 0, half)
                     else:
-                        ci["position"]["y"] += half
-                        cj["position"]["y"] -= half
+                        _move_ids(cluster_i, 0, half)
+                        _move_ids(cluster_j, 0, -half)
 
                 any_moved = True
 
@@ -439,76 +1031,265 @@ def _midpoint(
     return ((p1[0] + p2[0]) / 2, (p1[1] + p2[1]) / 2)
 
 
-def _draw_trunk_net(
-    dwg: svgwrite.Drawing,
-    wire_group,
-    net_label_group,
+def _preregister_stubs(
     registry: "_SegmentRegistry",
-    conn_pts: list,
-    stroke: str,
-    name: str,
+    components: list,
+    pin_endpoints: dict,
+    pin_lane_exits: dict,
 ) -> None:
-    """
-    Route a net with 3+ connections via a horizontal trunk line.
+    """Reserve tip→lane breakout segments so mid-routes do not collide with them."""
+    for comp in components:
+        for pin_idx, pin in enumerate(comp.get("pins", [])):
+            key = (comp["id"], pin["number"])
+            tip = pin_endpoints.get(key)
+            lane = pin_lane_exits.get(key)
+            if not tip or not lane:
+                continue
+            side = pin.get("side", "left")
+            if side in {"left", "right"}:
+                registry.register_h(tip[1], tip[0], lane[0])
+            else:
+                registry.register_v(tip[0], tip[1], lane[1])
 
-    Each pin gets:  tip → lane_exit → vertical stub → horizontal trunk
-    The trunk is a single horizontal line at a conflict-free Y, connecting
-    the leftmost and rightmost vertical stub X positions.
-    This avoids the chain-routing problem (wires doubling back mid-route)
-    and keeps every pin's trace in its own lane.
+
+def _pick_trunk_y(
+    registry: "_SegmentRegistry",
+    lanes: list[_PtF],
+    obstacles: list[_Rect],
+    max_tries: int = 30,
+) -> float:
+    """Choose a horizontal trunk Y clear of wires and foreign component bodies."""
+    x_vals = [lx for lx, _ in lanes]
+    x_min = min(x_vals) - WIRE_SPACING
+    x_max = max(x_vals) + WIRE_SPACING
+    y_centroid = sum(ly for _, ly in lanes) / len(lanes)
+
+    offsets = [0]
+    for k in range(1, max_tries):
+        offsets += [k * WIRE_SPACING, -k * WIRE_SPACING]
+
+    for off in offsets:
+        ty = y_centroid + off
+        trunk_pts = [(x_min, ty), (x_max, ty)]
+        if not registry.path_ok(trunk_pts, obstacles):
+            continue
+        if any(
+            not registry.path_ok([(lx, ly), (lx, ty)], obstacles)
+            for lx, ly in lanes
+        ):
+            continue
+        return ty
+    return y_centroid
+
+
+def _compute_trunk_geom(
+    registry: "_SegmentRegistry",
+    conn_pts: list[tuple[_PtF, _PtF]],
+    obstacles: list[_Rect],
+    max_tries: int = 30,
+) -> dict:
+    """
+    Compute trunk geometry for a 3+ pin net and register its segments.
+    Returns dict with trunk_y, x_min, x_max, junctions.
     """
     lanes = [lane for _, lane in conn_pts]
     x_vals = [lx for lx, _ in lanes]
     x_min = min(x_vals) - WIRE_SPACING
     x_max = max(x_vals) + WIRE_SPACING
+    trunk_y = _pick_trunk_y(registry, lanes, obstacles, max_tries=max_tries)
 
-    # Find a conflict-free horizontal trunk Y near the centroid of lane exits
-    y_centroid = sum(ly for _, ly in lanes) / len(lanes)
-    trunk_y = y_centroid
-    offsets = [0]
-    for k in range(1, 25):
-        offsets += [k * WIRE_SPACING, -k * WIRE_SPACING]
-
-    for off in offsets:
-        ty = y_centroid + off
-        h_clear = not registry._h_conflict(ty, x_min, x_max)
-        v_clear = all(not registry._v_conflict(lx, ly, ty) for lx, ly in lanes)
-        if h_clear and v_clear:
-            trunk_y = ty
-            break
-
-    # Register trunk + all vertical branches
     registry.register_h(trunk_y, x_min, x_max)
+    junctions: list[_PtF] = []
     for lx, ly in lanes:
         registry.register_v(lx, ly, trunk_y)
+        junctions.append((lx, trunk_y))
 
-    # Draw the trunk
+    return {
+        "kind": "trunk",
+        "trunk_y": trunk_y,
+        "x_min": x_min,
+        "x_max": x_max,
+        "junctions": junctions,
+        "conn_pts": conn_pts,
+        "label_at": ((x_min + x_max) / 2, trunk_y),
+    }
+
+
+def _compute_two_pin_geom(
+    registry: "_SegmentRegistry",
+    tip1: _PtF,
+    lane1: _PtF,
+    tip2: _PtF,
+    lane2: _PtF,
+    obstacles: list[_Rect],
+    max_tries: int = 12,
+) -> dict:
+    mid = registry.route(lane1, lane2, max_tries=max_tries, obstacles=obstacles)
+    # tip→lane stubs are pre-registered; include them in the drawn polyline
+    points = [tip1, lane1] + mid[1:-1] + [lane2, tip2]
+    # Deduplicate consecutive equals
+    cleaned: list[_PtF] = [points[0]]
+    for p in points[1:]:
+        if abs(p[0] - cleaned[-1][0]) > 0.5 or abs(p[1] - cleaned[-1][1]) > 0.5:
+            cleaned.append(p)
+    return {
+        "kind": "two_pin",
+        "points": cleaned,
+        "label_at": _midpoint(lane1, lane2),
+    }
+
+
+def _route_one_signal(
+    registry: "_SegmentRegistry",
+    components: list,
+    job: dict,
+    max_tries: int,
+) -> dict:
+    attached = job["attached"]
+    obstacles = _obstacles_for_net(components, attached)
+    conn_pts = job["conn_pts"]
+    if len(conn_pts) == 2:
+        (tip1, lane1), (tip2, lane2) = conn_pts
+        return _compute_two_pin_geom(
+            registry, tip1, lane1, tip2, lane2, obstacles, max_tries=max_tries,
+        )
+    return _compute_trunk_geom(registry, conn_pts, obstacles, max_tries=max_tries + 10)
+
+
+def _geom_still_conflicts(
+    components: list,
+    job: dict,
+    geom: dict,
+) -> bool:
+    """True if this net's geometry still crosses a foreign body."""
+    obstacles = _obstacles_for_net(components, job["attached"])
+    if not obstacles:
+        return False
+    if geom["kind"] == "two_pin":
+        return _path_hits_obstacles(geom["points"], obstacles)
+    # trunk: check trunk + each vertical branch
+    ty = geom["trunk_y"]
+    if _path_hits_obstacles([(geom["x_min"], ty), (geom["x_max"], ty)], obstacles):
+        return True
+    for tip, lane in geom["conn_pts"]:
+        lx, ly = lane
+        if _path_hits_obstacles([tip, lane], obstacles):
+            return True
+        if _path_hits_obstacles([(lx, ly), (lx, ty)], obstacles):
+            return True
+    return False
+
+
+def _multi_pass_route_signals(
+    components: list,
+    signal_jobs: list[dict],
+    pin_endpoints: dict,
+    pin_lane_exits: dict,
+    passes: int = ROUTE_PASSES,
+) -> list[dict]:
+    """
+    After component layout, route all signal nets ``passes`` times.
+
+    Each pass rebuilds the segment registry, re-routes every net (avoiding
+    foreign component bodies and other traces), and prefers nets that still
+    conflict so later passes can clear them with wider search.
+    """
+    if not signal_jobs:
+        return []
+
+    n = len(signal_jobs)
+    geoms: list[dict | None] = [None] * n
+    # Indices that still need a better route (start with all)
+    dirty = set(range(n))
+
+    for pass_i in range(passes):
+        registry = _SegmentRegistry()
+        _preregister_stubs(registry, components, pin_endpoints, pin_lane_exits)
+
+        # Wider offset search on later passes
+        max_tries = 12 + pass_i * 6
+
+        # Order: dirty nets first (resolve conflicts), then alternate direction
+        clean = [i for i in range(n) if i not in dirty]
+        dirty_list = sorted(dirty)
+        if pass_i % 2 == 1:
+            dirty_list = list(reversed(dirty_list))
+            clean = list(reversed(clean))
+        # On the last pass, also prefer longer nets first among dirty
+        if pass_i == passes - 1:
+            dirty_list = sorted(
+                dirty_list,
+                key=lambda i: -_net_span(signal_jobs[i]),
+            )
+
+        order = dirty_list + clean
+        new_geoms: list[dict | None] = [None] * n
+        for i in order:
+            new_geoms[i] = _route_one_signal(
+                registry, components, signal_jobs[i], max_tries=max_tries,
+            )
+        geoms = new_geoms  # type: ignore[assignment]
+
+        # Mark nets that still pierce foreign bodies so the next pass
+        # routes them first (with a wider search).
+        dirty = {
+            i for i in range(n)
+            if geoms[i] is not None
+            and _geom_still_conflicts(
+                components, signal_jobs[i], geoms[i],  # type: ignore[arg-type]
+            )
+        }
+
+    return [g for g in geoms]  # type: ignore[misc]
+
+
+def _net_span(job: dict) -> float:
+    """Rough geometric span — longer nets get priority on the final pass."""
+    xs = [lane[0] for _, lane in job["conn_pts"]]
+    ys = [lane[1] for _, lane in job["conn_pts"]]
+    return (max(xs) - min(xs)) + (max(ys) - min(ys))
+
+
+def _draw_routed_net(
+    dwg: svgwrite.Drawing,
+    wire_group,
+    net_label_group,
+    job: dict,
+    geom: dict,
+) -> None:
+    """Draw a previously computed signal-net geometry."""
+    stroke = job["stroke"]
+    name = job["name"]
+
+    if geom["kind"] == "two_pin":
+        wire_group.add(dwg.polyline(
+            points=geom["points"],
+            stroke=stroke, stroke_width=WIRE_W, fill="none",
+            stroke_linejoin="round", stroke_linecap="round",
+        ))
+        _draw_net_label(dwg, net_label_group, name, *geom["label_at"])
+        return
+
+    # Trunk
+    ty = geom["trunk_y"]
     wire_group.add(dwg.line(
-        start=(x_min, trunk_y), end=(x_max, trunk_y),
+        start=(geom["x_min"], ty), end=(geom["x_max"], ty),
         stroke=stroke, stroke_width=WIRE_W, stroke_linecap="round",
     ))
-
-    # Draw each connection: tip → lane → vertical stub to trunk
-    for tip, lane in conn_pts:
+    for tip, lane in geom["conn_pts"]:
         lx, ly = lane
-        # Stub extension: tip → lane_exit (unique comb tooth)
         if abs(tip[0] - lx) > 1 or abs(tip[1] - ly) > 1:
             wire_group.add(dwg.line(
                 start=tip, end=lane,
                 stroke=stroke, stroke_width=WIRE_W, stroke_linecap="round",
             ))
-        # Vertical branch: lane_exit → trunk
-        if abs(ly - trunk_y) > 1:
+        if abs(ly - ty) > 1:
             wire_group.add(dwg.line(
-                start=(lx, ly), end=(lx, trunk_y),
+                start=(lx, ly), end=(lx, ty),
                 stroke=stroke, stroke_width=WIRE_W, stroke_linecap="round",
             ))
-        # Junction dot where stub meets trunk
-        wire_group.add(dwg.circle(center=(lx, trunk_y), r=3, fill=stroke))
-
-    # Net label centred on the trunk
-    mid_x = (x_min + x_max) / 2
-    _draw_net_label(dwg, net_label_group, name, mid_x, trunk_y)
+        wire_group.add(dwg.circle(center=(lx, ty), r=3, fill=stroke))
+    _draw_net_label(dwg, net_label_group, name, *geom["label_at"])
 
 
 def _draw_component(dwg: svgwrite.Drawing, group, comp: dict) -> None:
@@ -866,49 +1647,102 @@ def _draw_power_symbol(
     net_name: str,
     x: float,
     y: float,
+    side: str = "bottom",
 ) -> None:
-    """Draw VCC (arrow up) or GND (flat bars) power symbol at the pin tip."""
-    name_upper = net_name.upper()
-    is_gnd = name_upper in {"GND", "AGND", "DGND", "PGND", "0V"}
+    """Draw VCC (arrow) or GND (flat bars) power symbol at the pin tip.
+
+    The symbol extends outward from the pin along ``side``.
+    """
+    is_gnd = _is_gnd_net(net_name)
+    stroke = _gnd_stroke(net_name) if is_gnd else _power_stroke(net_name)
 
     if is_gnd:
-        # Three horizontal bars decreasing in width (IEEE GND symbol)
-        for i, bar_w in enumerate([16, 10, 4]):
-            yy = y + i * 4
+        # Three bars decreasing in width (IEEE GND), oriented outward from pin
+        bar_widths = [16, 10, 4]
+        step = 4
+        for i, bar_w in enumerate(bar_widths):
+            half = bar_w / 2
+            if side == "top":
+                yy = y - i * step
+                pts = ((x - half, yy), (x + half, yy))
+            elif side == "left":
+                xx = x - i * step
+                pts = ((xx, y - half), (xx, y + half))
+            elif side == "right":
+                xx = x + i * step
+                pts = ((xx, y - half), (xx, y + half))
+            else:  # bottom (default)
+                yy = y + i * step
+                pts = ((x - half, yy), (x + half, yy))
             group.add(dwg.line(
-                start=(x - bar_w / 2, yy),
-                end=(x + bar_w / 2, yy),
-                stroke=GND_STROKE,
+                start=pts[0], end=pts[1],
+                stroke=stroke,
                 stroke_width=1.5,
                 stroke_linecap="round",
             ))
+        label_off = {
+            "top": (x, y - 20),
+            "left": (x - 22, y + 3),
+            "right": (x + 22, y + 3),
+            "bottom": (x, y + 20),
+        }.get(side, (x, y + 20))
         group.add(dwg.text(
             net_name,
-            insert=(x, y + 20),
+            insert=label_off,
             font_size=PIN_FONT,
             font_family="monospace",
-            fill=GND_STROKE,
+            fill=stroke,
             text_anchor="middle",
         ))
     else:
-        # Arrow pointing up + net name label
+        # Arrow pointing outward + net name label
         arrow_h = 16
         arrow_w = 8
-        group.add(dwg.line(
-            start=(x, y),
-            end=(x, y - arrow_h),
-            stroke=POWER_STROKE,
-            stroke_width=1.5,
-        ))
-        group.add(dwg.polygon(
-            points=[(x, y - arrow_h - 8), (x - arrow_w / 2, y - arrow_h), (x + arrow_w / 2, y - arrow_h)],
-            fill=POWER_STROKE,
-        ))
+        if side == "bottom":
+            tip = (x, y + arrow_h + 8)
+            base_y = y + arrow_h
+            group.add(dwg.line(start=(x, y), end=(x, base_y),
+                               stroke=stroke, stroke_width=1.5))
+            group.add(dwg.polygon(
+                points=[tip, (x - arrow_w / 2, base_y), (x + arrow_w / 2, base_y)],
+                fill=stroke,
+            ))
+            label_at = (x, y + arrow_h + 20)
+        elif side == "left":
+            tip = (x - arrow_h - 8, y)
+            base_x = x - arrow_h
+            group.add(dwg.line(start=(x, y), end=(base_x, y),
+                               stroke=stroke, stroke_width=1.5))
+            group.add(dwg.polygon(
+                points=[tip, (base_x, y - arrow_w / 2), (base_x, y + arrow_w / 2)],
+                fill=stroke,
+            ))
+            label_at = (x - arrow_h - 14, y - 10)
+        elif side == "right":
+            tip = (x + arrow_h + 8, y)
+            base_x = x + arrow_h
+            group.add(dwg.line(start=(x, y), end=(base_x, y),
+                               stroke=stroke, stroke_width=1.5))
+            group.add(dwg.polygon(
+                points=[tip, (base_x, y - arrow_w / 2), (base_x, y + arrow_w / 2)],
+                fill=stroke,
+            ))
+            label_at = (x + arrow_h + 14, y - 10)
+        else:  # top (default for VCC)
+            tip = (x, y - arrow_h - 8)
+            base_y = y - arrow_h
+            group.add(dwg.line(start=(x, y), end=(x, base_y),
+                               stroke=stroke, stroke_width=1.5))
+            group.add(dwg.polygon(
+                points=[tip, (x - arrow_w / 2, base_y), (x + arrow_w / 2, base_y)],
+                fill=stroke,
+            ))
+            label_at = (x, y - arrow_h - 12)
         group.add(dwg.text(
             net_name,
-            insert=(x, y - arrow_h - 12),
+            insert=label_at,
             font_size=PIN_FONT,
             font_family="monospace",
-            fill=POWER_STROKE,
+            fill=stroke,
             text_anchor="middle",
         ))

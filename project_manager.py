@@ -173,8 +173,19 @@ def write_part_descriptions(project: Project, data: dict) -> None:
 
 
 def read_token_usage(project: Project) -> dict:
-    """Return {"input_tokens", "output_tokens", "total_tokens", "requests"}, zeroed if none."""
-    usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "requests": 0}
+    """Return cumulative token usage, zeroed if none.
+
+    input_tokens excludes cached tokens; cache_read_tokens and cache_write_tokens
+    are counted separately (billed at ~0.1x and ~1.25x the input rate).
+    """
+    usage = {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "total_tokens": 0,
+        "requests": 0,
+    }
     if project.token_usage_path.exists():
         try:
             usage.update(json.loads(project.token_usage_path.read_text(encoding="utf-8")))
@@ -183,12 +194,23 @@ def read_token_usage(project: Project) -> dict:
     return usage
 
 
-def add_token_usage(project: Project, input_tokens: int, output_tokens: int) -> dict:
+def add_token_usage(
+    project: Project,
+    input_tokens: int,
+    output_tokens: int,
+    cache_read_tokens: int = 0,
+    cache_write_tokens: int = 0,
+) -> dict:
     """Add one request's usage to the project's running total and return the new total."""
     usage = read_token_usage(project)
     usage["input_tokens"] += input_tokens
     usage["output_tokens"] += output_tokens
-    usage["total_tokens"] = usage["input_tokens"] + usage["output_tokens"]
+    usage["cache_read_tokens"] += cache_read_tokens
+    usage["cache_write_tokens"] += cache_write_tokens
+    usage["total_tokens"] = (
+        usage["input_tokens"] + usage["output_tokens"]
+        + usage["cache_read_tokens"] + usage["cache_write_tokens"]
+    )
     usage["requests"] += 1
     project.token_usage_path.write_text(json.dumps(usage, indent=2), encoding="utf-8")
     return usage

@@ -197,7 +197,7 @@ async def process_prompt(req: PromptRequest):
             kicad_symbols=kicad_data,
             existing_circuit=existing_circuit,
             design_intent=_design_intent(project),
-            on_usage=lambda i, o: project_manager.add_token_usage(project, i, o),
+            on_usage=lambda i, o, cr, cw: project_manager.add_token_usage(project, i, o, cr, cw),
             model=req.model,
         )
     except EnvironmentError as e:

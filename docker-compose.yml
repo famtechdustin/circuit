@@ -8,6 +8,9 @@ services:
       - ./projects:/app/projects
       # Downloaded KiCad symbol libraries, so they are fetched only once
       - ./cache:/app/cache
+      # Live UI updates without rebuilding the image
+      - ./static:/app/static
+      - ./templates:/app/templates
     env_file:
       - .env
     restart: unless-stopped

@@ -107,17 +107,17 @@
     </div>
   </main>
 
-  <div id="panel-resizer" class="panel-resizer" title="Drag to resize · double-click to reset"></div>
-
   <!-- RIGHT PANEL: SVG schematic -->
-  <aside class="panel panel-right">
+  <aside class="panel panel-right" id="panel-right">
+    <div id="panel-resizer" class="panel-resizer" title="Drag to resize panel · double-click to reset"></div>
     <div class="svg-toolbar">
       <h2>Schematic</h2>
       <div class="svg-controls">
-        <button onclick="zoomIn()" title="Zoom in">+</button>
-        <button onclick="zoomOut()" title="Zoom out">−</button>
-        <button onclick="zoomReset()" title="Fit">Fit</button>
-        <button onclick="downloadSvg()" title="Download SVG">↓ SVG</button>
+        <button type="button" onclick="zoomOut()" title="Zoom out">−</button>
+        <span id="zoom-label">100%</span>
+        <button type="button" onclick="zoomIn()" title="Zoom in">+</button>
+        <button type="button" onclick="zoomReset()" title="Fit to panel">Fit</button>
+        <button type="button" onclick="downloadSvg()" title="Download SVG">↓ SVG</button>
       </div>
     </div>
     <div class="download-bar">
@@ -237,7 +237,10 @@ function renderTokenBadge(usage) {
   if (!usage) { badge.style.display = 'none'; return; }
   const fmt = n => n.toLocaleString();
   badge.textContent = `${fmt(usage.total_tokens)} tokens`;
-  badge.title = `Input: ${fmt(usage.input_tokens)}\nOutput: ${fmt(usage.output_tokens)}\nRequests: ${fmt(usage.requests)}`;
+  badge.title = `Input: ${fmt(usage.input_tokens)}\n`
+    + `Cache read: ${fmt(usage.cache_read_tokens || 0)}\n`
+    + `Cache write: ${fmt(usage.cache_write_tokens || 0)}\n`
+    + `Output: ${fmt(usage.output_tokens)}\nRequests: ${fmt(usage.requests)}`;
   badge.style.display = '';
 }
 
@@ -692,12 +695,23 @@ async function refreshSvg() {
   const svgText = await res.text();
   const panel = document.getElementById('svg-panel');
   panel.innerHTML = svgText;
-  applyTransform();
+  // Strip fixed pixel attrs so CSS width:100% can size the SVG to the panel
+  const svg = panel.querySelector('svg');
+  if (svg) {
+    svg.removeAttribute('width');
+    svg.removeAttribute('height');
+    svg.style.width = '100%';
+    svg.style.height = 'auto';
+    svg.style.display = 'block';
+  }
+  zoomReset();
 }
 
 function applyTransform() {
   const panel = document.getElementById('svg-panel');
   panel.style.transform = `translate(${svgPanX}px, ${svgPanY}px) scale(${svgZoom})`;
+  const label = document.getElementById('zoom-label');
+  if (label) label.textContent = `${Math.round(svgZoom * 100)}%`;
 }
 
 function zoomIn() {
@@ -717,6 +731,19 @@ function zoomReset() {
   applyTransform();
 }
 
+function zoomAt(clientX, clientY, factor) {
+  const container = document.getElementById('svg-container');
+  const rect = container.getBoundingClientRect();
+  const mx = clientX - rect.left;
+  const my = clientY - rect.top;
+  const next = Math.min(Math.max(svgZoom * factor, 0.1), 8);
+  // Keep the point under the cursor stable while zooming
+  svgPanX = mx - (mx - svgPanX) * (next / svgZoom);
+  svgPanY = my - (my - svgPanY) * (next / svgZoom);
+  svgZoom = next;
+  applyTransform();
+}
+
 async function downloadSvg() {
   if (!currentProject) return;
   const res = await fetch(`/svg/${currentProject}`);
@@ -730,11 +757,12 @@ async function downloadSvg() {
   URL.revokeObjectURL(url);
 }
 
-// Pan support
+// Pan + wheel-zoom support
 function setupSvgPan() {
   const container = document.getElementById('svg-container');
 
   container.addEventListener('mousedown', (e) => {
+    if (e.button !== 0) return;
     isPanning = true;
     panStart = {x: e.clientX, y: e.clientY};
     svgPanStartX = svgPanX;
@@ -750,37 +778,36 @@ function setupSvgPan() {
   });
 
   window.addEventListener('mouseup', () => {
+    if (!isPanning) return;
     isPanning = false;
     container.style.cursor = 'grab';
   });
 
   container.addEventListener('wheel', (e) => {
     e.preventDefault();
-    const delta = e.deltaY > 0 ? 0.9 : 1.1;
-    svgZoom = Math.min(Math.max(svgZoom * delta, 0.1), 8);
-    applyTransform();
+    const factor = e.deltaY > 0 ? 0.9 : 1.1;
+    zoomAt(e.clientX, e.clientY, factor);
   }, {passive: false});
 }
 
 // Right panel width resizing
 const RIGHT_PANEL_DEFAULT_W = 420;
-const RIGHT_PANEL_MIN_W = 300;
-const CENTER_PANEL_MIN_W = 320;
+const RIGHT_PANEL_MIN_W = 240;
+const CENTER_PANEL_MIN_W = 220;
 
 function setRightPanelWidth(w) {
-  const panel = document.querySelector('.panel-right');
+  const panel = document.getElementById('panel-right');
   const layout = document.querySelector('.layout');
   const left = document.querySelector('.panel-left');
-  const resizer = document.getElementById('panel-resizer');
-  const maxW = layout.clientWidth - left.offsetWidth - resizer.offsetWidth - CENTER_PANEL_MIN_W;
-  const clamped = Math.max(RIGHT_PANEL_MIN_W, Math.min(w, maxW));
+  const maxW = layout.clientWidth - left.offsetWidth - CENTER_PANEL_MIN_W;
+  const clamped = Math.max(RIGHT_PANEL_MIN_W, Math.min(w, Math.max(RIGHT_PANEL_MIN_W, maxW)));
   panel.style.width = `${clamped}px`;
   return clamped;
 }
 
 function setupPanelResizer() {
   const resizer = document.getElementById('panel-resizer');
-  const panel = document.querySelector('.panel-right');
+  const panel = document.getElementById('panel-right');
 
   const saved = parseInt(localStorage.getItem('rightPanelWidth'), 10);
   if (saved) setRightPanelWidth(saved);
@@ -791,15 +818,18 @@ function setupPanelResizer() {
 
   resizer.addEventListener('mousedown', (e) => {
     e.preventDefault();
+    e.stopPropagation();
     dragging = true;
+    isPanning = false;
     startX = e.clientX;
-    startW = panel.offsetWidth;
+    startW = panel.getBoundingClientRect().width;
     resizer.classList.add('active');
     document.body.classList.add('resizing');
   });
 
   window.addEventListener('mousemove', (e) => {
     if (!dragging) return;
+    e.preventDefault();
     setRightPanelWidth(startW + (startX - e.clientX));
   });
 
@@ -808,15 +838,16 @@ function setupPanelResizer() {
     dragging = false;
     resizer.classList.remove('active');
     document.body.classList.remove('resizing');
-    localStorage.setItem('rightPanelWidth', panel.offsetWidth);
+    localStorage.setItem('rightPanelWidth', String(Math.round(panel.getBoundingClientRect().width)));
   });
 
-  resizer.addEventListener('dblclick', () => {
+  resizer.addEventListener('dblclick', (e) => {
+    e.preventDefault();
     setRightPanelWidth(RIGHT_PANEL_DEFAULT_W);
     localStorage.removeItem('rightPanelWidth');
   });
 
-  window.addEventListener('resize', () => setRightPanelWidth(panel.offsetWidth));
+  window.addEventListener('resize', () => setRightPanelWidth(panel.getBoundingClientRect().width));
 }
 
 // ---------------------------------------------------------------------------

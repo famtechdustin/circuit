@@ -4,8 +4,9 @@ eagle_exporter.py — Export a circuit JSON dict as an EAGLE XML schematic (.sch
 The output is meant for DipTrace Schematic (File → Import → Eagle). Each
 component gets its own rectangular symbol built from the JSON pin sides/offsets,
 plus a minimal package whose pads are the pin numbers. Connectivity is carried
-by <pinref> entries in each <net>; every connected pin gets a short wire stub
-and a net label, so no routed wires are needed.
+by continuous Manhattan-routed <wire> elements (plus <junction> on trunks) that
+geometrically join every <pinref> in a net, with a single net <label> for
+readability. Ground nets instead place a local GND supply symbol at each pin.
 
 All coordinates are in mm on a 0.1" (2.54 mm) grid so pins land on DipTrace's
 default grid.
@@ -158,6 +159,543 @@ def _bom_by_refdes(bom_rows: list[dict] | None) -> dict[str, dict]:
     return out
 
 
+# member: (part, pin_name, (x, y), side)  — coords in grid steps, y downward
+_Member = tuple[str, str, tuple[int, int], str]
+_Wire = tuple[int, int, int, int]  # x1, y1, x2, y2 in grid steps
+_Pt = tuple[int, int]
+_RectI = tuple[int, int, int, int]  # x1, y1, x2, y2 body obstacle
+
+_STUB_DIR = {"left": (-1, 0), "right": (1, 0), "top": (0, -1), "bottom": (0, 1)}
+_WIRE_W = "0.1524"
+_NET_LAYER = "91"
+_ROUTE_PASSES = 3
+_BODY_PAD = 1  # grid steps of clearance around foreign component bodies
+
+
+def _lane_exit(x: int, y: int, side: str) -> _Pt:
+    dx, dy = _STUB_DIR.get(side, (1, 0))
+    return (x + dx * STUB_LEN, y + dy * STUB_LEN)
+
+
+def _add_seg(wires: list[_Wire], a: _Pt, b: _Pt) -> None:
+    """Append an axis-aligned segment if a and b differ."""
+    if a == b:
+        return
+    ax, ay = a
+    bx, by = b
+    if ax == bx or ay == by:
+        wires.append((ax, ay, bx, by))
+        return
+    # Should not happen for Manhattan paths; force L via horizontal first.
+    wires.append((ax, ay, bx, ay))
+    wires.append((bx, ay, bx, by))
+
+
+def _h_hits_rect(y: int, x1: int, x2: int, rect: _RectI) -> bool:
+    rx1, ry1, rx2, ry2 = rect
+    if y <= ry1 or y >= ry2:
+        return False
+    return max(x1, x2) > rx1 and min(x1, x2) < rx2
+
+
+def _v_hits_rect(x: int, y1: int, y2: int, rect: _RectI) -> bool:
+    rx1, ry1, rx2, ry2 = rect
+    if x <= rx1 or x >= rx2:
+        return False
+    return max(y1, y2) > ry1 and min(y1, y2) < ry2
+
+
+def _seg_hits_obstacles(a: _Pt, b: _Pt, obstacles: list[_RectI]) -> bool:
+    ax, ay = a
+    bx, by = b
+    if ay == by:
+        return any(_h_hits_rect(ay, ax, bx, r) for r in obstacles)
+    if ax == bx:
+        return any(_v_hits_rect(ax, ay, by, r) for r in obstacles)
+    mid = (bx, ay)
+    return _seg_hits_obstacles(a, mid, obstacles) or _seg_hits_obstacles(mid, b, obstacles)
+
+
+def _wires_hit_obstacles(wires: list[_Wire], obstacles: list[_RectI]) -> bool:
+    return any(
+        _seg_hits_obstacles((x1, y1), (x2, y2), obstacles)
+        for x1, y1, x2, y2 in wires
+    )
+
+
+class _GridRouter:
+    """Tracks placed wire segments and finds obstacle-clear Manhattan paths."""
+
+    def __init__(self) -> None:
+        self._h: list[tuple[int, int, int]] = []  # (y, xmin, xmax)
+        self._v: list[tuple[int, int, int]] = []  # (x, ymin, ymax)
+
+    def register(self, wires: list[_Wire]) -> None:
+        for x1, y1, x2, y2 in wires:
+            if y1 == y2 and x1 != x2:
+                self._h.append((y1, min(x1, x2), max(x1, x2)))
+            elif x1 == x2 and y1 != y2:
+                self._v.append((x1, min(y1, y2), max(y1, y2)))
+
+    def _h_conflict(self, y: int, x1: int, x2: int) -> bool:
+        xmin, xmax = min(x1, x2), max(x1, x2)
+        if xmin == xmax:
+            return False
+        for ey, exmin, exmax in self._h:
+            if ey == y and xmin < exmax and xmax > exmin:
+                return True
+        return False
+
+    def _v_conflict(self, x: int, y1: int, y2: int) -> bool:
+        ymin, ymax = min(y1, y2), max(y1, y2)
+        if ymin == ymax:
+            return False
+        for ex, eymin, eymax in self._v:
+            if ex == x and ymin < eymax and ymax > eymin:
+                return True
+        return False
+
+    def _wires_conflict(self, wires: list[_Wire]) -> bool:
+        for x1, y1, x2, y2 in wires:
+            if y1 == y2:
+                if self._h_conflict(y1, x1, x2):
+                    return True
+            elif x1 == x2:
+                if self._v_conflict(x1, y1, y2):
+                    return True
+        return False
+
+    def path_ok(self, wires: list[_Wire], obstacles: list[_RectI]) -> bool:
+        if obstacles and _wires_hit_obstacles(wires, obstacles):
+            return False
+        return not self._wires_conflict(wires)
+
+    def manhattan(self, a: _Pt, b: _Pt, obstacles: list[_RectI], max_tries: int = 12) -> list[_Wire]:
+        """Obstacle- and wire-aware Manhattan path from a to b."""
+        if a == b:
+            return []
+        ax, ay = a
+        bx, by = b
+
+        def try_wires(cand: list[_Wire]) -> list[_Wire] | None:
+            if self.path_ok(cand, obstacles):
+                self.register(cand)
+                return cand
+            return None
+
+        # Direct H / V
+        if ay == by or ax == bx:
+            direct: list[_Wire] = []
+            _add_seg(direct, a, b)
+            got = try_wires(direct)
+            if got is not None:
+                return got
+            for k in range(1, max_tries + 1):
+                for sign in (1, -1):
+                    detour: list[_Wire] = []
+                    if ay == by:
+                        my = ay + sign * k
+                        _add_seg(detour, a, (ax, my))
+                        _add_seg(detour, (ax, my), (bx, my))
+                        _add_seg(detour, (bx, my), b)
+                    else:
+                        mx = ax + sign * k
+                        _add_seg(detour, a, (mx, ay))
+                        _add_seg(detour, (mx, ay), (mx, by))
+                        _add_seg(detour, (mx, by), b)
+                    got = try_wires(detour)
+                    if got is not None:
+                        return got
+            fallback: list[_Wire] = []
+            _add_seg(fallback, a, b)
+            self.register(fallback)
+            return fallback
+
+        offsets = [0]
+        for k in range(1, max_tries):
+            offsets += [k, -k]
+
+        # H-then-V via mid-x; V-then-H via mid-y
+        base_mx = (ax + bx) // 2
+        base_my = (ay + by) // 2
+        for off in offsets:
+            mx = base_mx + off
+            cand = []
+            _add_seg(cand, a, (mx, ay))
+            _add_seg(cand, (mx, ay), (mx, by))
+            _add_seg(cand, (mx, by), b)
+            got = try_wires(cand)
+            if got is not None:
+                return got
+
+            my = base_my + off
+            cand = []
+            _add_seg(cand, a, (ax, my))
+            _add_seg(cand, (ax, my), (bx, my))
+            _add_seg(cand, (bx, my), b)
+            got = try_wires(cand)
+            if got is not None:
+                return got
+
+        # U-detours around the endpoint bounding box
+        for k in range(1, max_tries + 1):
+            top, bot = min(ay, by) - k, max(ay, by) + k
+            left, right = min(ax, bx) - k, max(ax, bx) + k
+            for via in (
+                [(ax, top), (bx, top)],
+                [(ax, bot), (bx, bot)],
+                [(left, ay), (left, by)],
+                [(right, ay), (right, by)],
+            ):
+                cand = []
+                _add_seg(cand, a, via[0])
+                _add_seg(cand, via[0], via[1])
+                _add_seg(cand, via[1], b)
+                got = try_wires(cand)
+                if got is not None:
+                    return got
+
+        fallback = []
+        _add_seg(fallback, a, (bx, ay))
+        _add_seg(fallback, (bx, ay), b)
+        self.register(fallback)
+        return fallback
+
+
+def _route_two_pin(
+    m1: _Member,
+    m2: _Member,
+    router: _GridRouter,
+    obstacles: list[_RectI],
+    max_tries: int = 12,
+) -> list[_Wire]:
+    """Stub out from each pin tip, then Manhattan between lane exits."""
+    _, _, (x1, y1), side1 = m1
+    _, _, (x2, y2), side2 = m2
+    lane1 = _lane_exit(x1, y1, side1)
+    lane2 = _lane_exit(x2, y2, side2)
+    wires: list[_Wire] = []
+    stubs: list[_Wire] = []
+    _add_seg(stubs, (x1, y1), lane1)
+    _add_seg(stubs, lane2, (x2, y2))
+    # Stubs are short breakouts; register them then route between lanes
+    router.register(stubs)
+    mid = router.manhattan(lane1, lane2, obstacles, max_tries=max_tries)
+    wires.extend(stubs)
+    wires.extend(mid)
+    return wires
+
+
+def _trunk_route(
+    members: list[_Member],
+    router: _GridRouter,
+    obstacles: list[_RectI],
+    trunk_y: int | None = None,
+    max_tries: int = 20,
+) -> tuple[list[_Wire], list[_Pt]]:
+    """
+    Horizontal trunk with stubs from each pin tip via its lane exit.
+    Chooses a clear trunk_y when not forced (power rails).
+    Returns (wires, junction points on the trunk).
+    """
+    if not members:
+        return [], []
+
+    lanes: list[_Pt] = []
+    tips: list[_Pt] = []
+    for _, _, (x, y), side in members:
+        tips.append((x, y))
+        lanes.append(_lane_exit(x, y, side))
+
+    trunk_xs = sorted({lx for lx, _ in lanes})
+    x0, x1 = trunk_xs[0], trunk_xs[-1]
+
+    if trunk_y is None:
+        ys = sorted(ly for _, ly in lanes)
+        base = ys[len(ys) // 2]
+        chosen = base
+        for k in range(max_tries):
+            for ty in ([base] if k == 0 else [base + k, base - k]):
+                trunk_w: list[_Wire] = []
+                if x0 != x1:
+                    _add_seg(trunk_w, (x0, ty), (x1, ty))
+                branch_ok = True
+                branches: list[_Wire] = []
+                for lx, ly in lanes:
+                    br: list[_Wire] = []
+                    _add_seg(br, (lx, ly), (lx, ty))
+                    if not router.path_ok(br, obstacles):
+                        branch_ok = False
+                        break
+                    branches.extend(br)
+                if not branch_ok:
+                    continue
+                if trunk_w and not router.path_ok(trunk_w, obstacles):
+                    continue
+                chosen = ty
+                break
+            else:
+                continue
+            break
+        trunk_y = chosen
+
+    wires: list[_Wire] = []
+    junctions: list[_Pt] = []
+
+    for tip, lane in zip(tips, lanes):
+        lx, ly = lane
+        _add_seg(wires, tip, lane)
+        join = (lx, trunk_y)
+        _add_seg(wires, lane, join)
+        junctions.append(join)
+
+    if len(trunk_xs) >= 2:
+        _add_seg(wires, (trunk_xs[0], trunk_y), (trunk_xs[-1], trunk_y))
+
+    router.register(wires)
+
+    if len(members) < 3:
+        junctions = []
+    return wires, junctions
+
+
+def _power_trunk_y(
+    name: str,
+    power_rails: set[str],
+    all_tips_y: list[int],
+) -> int | None:
+    """Dedicated bus Y for VCC-type rails; GND uses local symbols instead."""
+    upper = name.upper()
+    rail_map = {r.upper(): r for r in power_rails}
+    if upper not in rail_map:
+        return None
+    if svg_generator._is_gnd_net(upper):
+        return None
+
+    ymin = min(all_tips_y) if all_tips_y else 0
+    vcc_u = sorted(r.upper() for r in power_rails if not svg_generator._is_gnd_net(r))
+    spacing = 4  # grid steps between parallel rails
+    if upper in vcc_u:
+        return ymin - STUB_LEN - 2 - vcc_u.index(upper) * spacing
+    return None
+
+
+def _add_gnd_supply(
+    packages: ET.Element,
+    symbols: ET.Element,
+    devicesets: ET.Element,
+    net_name: str,
+) -> str:
+    """
+    Add a one-pin IEEE ground supply device for ``net_name``.
+    Returns the deviceset name. Safe to call once per distinct ground net.
+    """
+    ds_name = _ident(net_name, "GND")
+    pin_name = ds_name
+    pkg_name = f"SUP_{ds_name}"
+
+    # Package: single dummy pad (schematic-only supply)
+    pkg = _sub(packages, "package", name=pkg_name)
+    _sub(pkg, "smd", name="1", x="0", y="0", dx="1.27", dy="1.27", layer="1")
+    _sub(pkg, "text", x="0", y=_mm(1), size="1.27", layer="25").text = ">NAME"
+
+    # Symbol: three decreasing bars below a point-length supply pin at origin
+    sym = _sub(symbols, "symbol", name=ds_name)
+    # Stem from pin to first bar
+    _sub(sym, "wire", x1="0", y1="0", x2="0", y2=_mm(-0.5),
+         width="0.1524", layer="94")
+    for i, half_w in enumerate([0.75, 0.5, 0.25]):  # grid steps
+        yy = -(1 + i)  # 1, 2, 3 grid steps below origin
+        _sub(sym, "wire",
+             x1=_mm(-half_w), y1=_mm(yy),
+             x2=_mm(half_w), y2=_mm(yy),
+             width="0.254", layer="94")
+    _sub(sym, "text", x="0", y=_mm(-4.2), size="1.27", layer="95",
+         align="center").text = net_name
+    _sub(sym, "pin", name=pin_name, x="0", y="0", visible="off",
+         length="point", direction="sup", rot="R270")
+
+    ds = _sub(devicesets, "deviceset", name=ds_name, prefix="GND", uservalue="no")
+    _sub(ds, "description").text = f"Ground supply ({net_name})"
+    _sub(_sub(ds, "gates"), "gate", name=GATE, symbol=ds_name, x="0", y="0")
+    dev = _sub(_sub(ds, "devices"), "device", name="", package=pkg_name)
+    _sub(_sub(dev, "connects"), "connect", gate=GATE, pin=pin_name, pad="1")
+    _sub(_sub(dev, "technologies"), "technology", name="")
+    return ds_name
+
+
+_SUPPLY_ROT = {
+    "bottom": "R0",    # symbol bars hang down (default)
+    "top": "R180",     # flip so bars go up
+    "left": "R270",    # bars go left (EAGLE CCW rot)
+    "right": "R90",    # bars go right
+}
+
+
+def _emit_gnd_local_net(
+    nets_el: ET.Element,
+    parts: ET.Element,
+    instances: ET.Element,
+    name: str,
+    members: list[_Member],
+    deviceset: str,
+    pin_name: str,
+) -> None:
+    """
+    Emit a ground net as independent segments: each component pin stubs out to
+    its own ground-supply instance (no shared ground bar).
+    """
+    net_el = _sub(nets_el, "net", name=name, class_="0")
+    for i, (part, pin, (x, y), side) in enumerate(members, start=1):
+        gnd_part = _ident(f"{deviceset}_{part}_{i}", f"GND{i}")
+        _sub(parts, "part", name=gnd_part, library=LIB, deviceset=deviceset,
+             device="", value=name)
+        lx, ly = _lane_exit(x, y, side)
+        _sub(instances, "instance", part=gnd_part, gate=GATE,
+             x=_mm(lx), y=_mm(-ly), rot=_SUPPLY_ROT.get(side, "R0"))
+
+        seg = _sub(net_el, "segment")
+        _sub(seg, "pinref", part=part, gate=GATE, pin=pin)
+        _sub(seg, "pinref", part=gnd_part, gate=GATE, pin=pin_name)
+        _write_wires(seg, [(x, y, lx, ly)] if (x, y) != (lx, ly) else [])
+
+
+def _write_wires(seg: ET.Element, wires: list[_Wire]) -> None:
+    for x1, y1, x2, y2 in wires:
+        _sub(seg, "wire",
+             x1=_mm(x1), y1=_mm(-y1), x2=_mm(x2), y2=_mm(-y2),
+             width=_WIRE_W, layer=_NET_LAYER)
+
+
+def _body_rects_for_parts(
+    part_bodies: dict[str, _RectI],
+    members: list[_Member],
+) -> list[_RectI]:
+    """Obstacle rects for component bodies this net does not attach to."""
+    attached = {part for part, _, _, _ in members}
+    return [rect for part, rect in part_bodies.items() if part not in attached]
+
+
+def _route_net_wires(
+    members: list[_Member],
+    router: _GridRouter,
+    obstacles: list[_RectI],
+    trunk_y: int | None = None,
+    max_tries: int = 12,
+) -> tuple[list[_Wire], list[_Pt], _Pt]:
+    """
+    Compute wires/junctions/label position for one net.
+    Returns (wires, junctions, label_at).
+    """
+    if len(members) == 1:
+        _, _, (x, y), side = members[0]
+        lane = _lane_exit(x, y, side)
+        wires: list[_Wire] = []
+        _add_seg(wires, (x, y), lane)
+        router.register(wires)
+        return wires, [], lane
+
+    if len(members) == 2 and trunk_y is None:
+        wires = _route_two_pin(
+            members[0], members[1], router, obstacles, max_tries=max_tries,
+        )
+        _, _, (x1, y1), s1 = members[0]
+        _, _, (x2, y2), s2 = members[1]
+        l1 = _lane_exit(x1, y1, s1)
+        l2 = _lane_exit(x2, y2, s2)
+        return wires, [], ((l1[0] + l2[0]) // 2, (l1[1] + l2[1]) // 2)
+
+    wires, junctions = _trunk_route(
+        members, router, obstacles, trunk_y=trunk_y, max_tries=max_tries + 8,
+    )
+    xs = [m[2][0] for m in members]
+    ty = trunk_y if trunk_y is not None else (
+        sorted(_lane_exit(*m[2], m[3])[1] for m in members)[len(members) // 2]
+    )
+    # Prefer actual trunk Y from a junction if present
+    if junctions:
+        ty = junctions[0][1]
+    return wires, junctions, ((min(xs) + max(xs)) // 2, ty)
+
+
+def _multi_pass_route_eagle(
+    jobs: list[dict],
+    part_bodies: dict[str, _RectI],
+    passes: int = _ROUTE_PASSES,
+) -> list[tuple[list[_Wire], list[_Pt], _Pt]]:
+    """
+    Route all non-GND nets ``passes`` times, avoiding foreign component bodies
+    and other traces. Dirty (still colliding) nets are re-routed first on
+    subsequent passes with a wider search.
+    """
+    n = len(jobs)
+    if n == 0:
+        return []
+
+    results: list[tuple[list[_Wire], list[_Pt], _Pt]] = [
+        ([], [], (0, 0)) for _ in range(n)
+    ]
+    dirty = set(range(n))
+
+    for pass_i in range(passes):
+        router = _GridRouter()
+        max_tries = 12 + pass_i * 4
+        dirty_list = sorted(dirty)
+        clean = [i for i in range(n) if i not in dirty]
+        if pass_i % 2 == 1:
+            dirty_list = list(reversed(dirty_list))
+            clean = list(reversed(clean))
+        order = dirty_list + clean
+
+        new_results: list[tuple[list[_Wire], list[_Pt], _Pt] | None] = [None] * n
+        for i in order:
+            job = jobs[i]
+            obstacles = _body_rects_for_parts(part_bodies, job["members"])
+            new_results[i] = _route_net_wires(
+                job["members"],
+                router,
+                obstacles,
+                trunk_y=job.get("trunk_y"),
+                max_tries=max_tries,
+            )
+        results = [r for r in new_results]  # type: ignore[misc]
+
+        dirty = set()
+        for i, job in enumerate(jobs):
+            wires, _, _ = results[i]
+            obstacles = _body_rects_for_parts(part_bodies, job["members"])
+            if obstacles and _wires_hit_obstacles(wires, obstacles):
+                dirty.add(i)
+
+    return results
+
+
+def _emit_net(
+    nets_el: ET.Element,
+    name: str,
+    members: list[_Member],
+    wires: list[_Wire],
+    junctions: list[_Pt],
+    label_at: _Pt,
+) -> None:
+    """
+    Emit one <net> with a single <segment> containing all pinrefs, routed
+    wires, junctions (for trunks), and one label.
+    """
+    net_el = _sub(nets_el, "net", name=name, class_="0")
+    seg = _sub(net_el, "segment")
+
+    for part, pin_name, _, _ in members:
+        _sub(seg, "pinref", part=part, gate=GATE, pin=pin_name)
+
+    _write_wires(seg, wires)
+    for jx, jy in junctions:
+        _sub(seg, "junction", x=_mm(jx), y=_mm(-jy))
+
+    _sub(seg, "label", x=_mm(label_at[0]), y=_mm(-label_at[1]),
+         size="1.778", layer="95", rot="R0")
+
+
 def generate_eagle_sch(circuit: dict, bom_rows: list[dict] | None = None) -> str:
     """
     Convert a circuit dict to an EAGLE XML schematic string.
@@ -167,7 +705,10 @@ def generate_eagle_sch(circuit: dict, bom_rows: list[dict] | None = None) -> str
     attached as an attribute, so DipTrace can match it to your pattern library.
     """
     components = copy.deepcopy(circuit.get("components", []))
-    svg_generator._resolve_overlaps(components)
+    nets = circuit.get("nets", [])
+    power_rails = set(circuit.get("power_rails", []) or [])
+    bonded = svg_generator.place_support_parts(components, nets, power_rails)
+    svg_generator._resolve_overlaps(components, bonded_pairs=bonded)
     bom = _bom_by_refdes(bom_rows)
 
     root = ET.Element("eagle", version="7.7.0")
@@ -198,6 +739,8 @@ def generate_eagle_sch(circuit: dict, bom_rows: list[dict] | None = None) -> str
     package_pads: dict[str, tuple[str, ...]] = {}
     # (component_id, pin_number) -> (part, pin name, absolute tip, side)
     pin_index: dict[tuple[str, str], tuple[str, str, tuple[int, int], str]] = {}
+    # part name -> body rect in grid steps (obstacle for foreign nets)
+    part_bodies: dict[str, _RectI] = {}
 
     for comp in components:
         cid = str(comp.get("id", "")).strip()
@@ -239,31 +782,55 @@ def generate_eagle_sch(circuit: dict, bom_rows: list[dict] | None = None) -> str
         ox = round(float(pos.get("x", 0)) / PX_PER_GRID)
         oy = round(float(pos.get("y", 0)) / PX_PER_GRID)
         _sub(instances, "instance", part=part, gate=GATE, x=_mm(ox), y=_mm(-oy))
+        part_bodies[part] = (
+            ox - _BODY_PAD, oy - _BODY_PAD,
+            ox + w + _BODY_PAD, oy + h + _BODY_PAD,
+        )
 
         for p in pins:
             tx, ty = p["tip"]
             pin_index[(cid, p["number"])] = (part, p["name"], (ox + tx, oy + ty), p["side"])
 
-    stub_dir = {"left": (-1, 0), "right": (1, 0), "top": (0, -1), "bottom": (0, 1)}
-    merged: dict[str, list[tuple]] = {}
+    power_rails = set(circuit.get("power_rails", []) or [])
+    # Case-insensitive set of ground rail names present in this circuit
+    gnd_rail_names = {r for r in power_rails if svg_generator._is_gnd_net(r)}
+    gnd_devices: dict[str, str] = {}  # upper net name -> deviceset name
+
+    merged: dict[str, list[_Member]] = {}
     for i, net in enumerate(circuit.get("nets", []), start=1):
-        name = _ident(net.get("name"), f"N${i}")
+        # Preserve FirstLetterCaps_Signal net names for DipTrace readability.
+        name = _ident(net.get("name"), f"N${i}", upper=False)
         for conn in net.get("connections", []):
             key = (str(conn.get("component_id", "")).strip(), str(conn.get("pin_number", "")))
             if key in pin_index:
                 merged.setdefault(name, []).append(pin_index[key])
 
+    all_tips_y = [tip[1] for _, _, tip, _ in pin_index.values()]
+    gnd_upper = {r.upper() for r in gnd_rail_names}
+
+    # GND nets: local symbols (no shared routing). Signal / VCC: multi-pass route.
+    route_jobs: list[dict] = []
     for name, members in merged.items():
-        net_el = _sub(nets_el, "net", name=name, class_="0")
-        for part, pin_name, (x, y), side in members:
-            dx, dy = stub_dir[side]
-            ex, ey = x + dx * STUB_LEN, y + dy * STUB_LEN
-            seg = _sub(net_el, "segment")
-            _sub(seg, "pinref", part=part, gate=GATE, pin=pin_name)
-            _sub(seg, "wire", x1=_mm(x), y1=_mm(-y), x2=_mm(ex), y2=_mm(-ey),
-                 width="0.1524", layer="91")
-            rot = {"left": "R180", "right": "R0", "top": "R90", "bottom": "R270"}[side]
-            _sub(seg, "label", x=_mm(ex), y=_mm(-ey), size="1.778", layer="95", rot=rot)
+        if svg_generator._is_gnd_net(name) or name.upper() in gnd_upper:
+            key = name.upper()
+            if key not in gnd_devices:
+                gnd_devices[key] = _add_gnd_supply(
+                    packages, symbols, devicesets, name)
+            ds = gnd_devices[key]
+            _emit_gnd_local_net(
+                nets_el, parts, instances, name, members,
+                deviceset=ds, pin_name=_ident(name, "GND"),
+            )
+            continue
+        route_jobs.append({
+            "name": name,
+            "members": members,
+            "trunk_y": _power_trunk_y(name, power_rails, all_tips_y),
+        })
+
+    routed = _multi_pass_route_eagle(route_jobs, part_bodies)
+    for job, (wires, junctions, label_at) in zip(route_jobs, routed):
+        _emit_net(nets_el, job["name"], job["members"], wires, junctions, label_at)
 
     ET.indent(root)
     return (
