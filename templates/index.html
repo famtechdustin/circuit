@@ -79,6 +79,19 @@
         <input type="number" id="canvas-h" placeholder="H px" min="500" step="100" title="Minimum canvas height (px)">
         <button class="btn-secondary" onclick="regenSvg()" title="Re-render SVG from current circuit.json (no API call)">Regen SVG</button>
       </div>
+
+      <div class="design-prefs" id="design-prefs">
+        <h3>Package defaults</h3>
+        <p class="hint">Per-project footprints for common parts (BOM / Eagle).</p>
+        <div class="prefs-grid" id="prefs-grid">
+          <label>R <select id="pref-resistor"></select></label>
+          <label>C <select id="pref-capacitor"></select></label>
+          <label>L <select id="pref-inductor"></select></label>
+          <label>LED <select id="pref-led"></select></label>
+        </div>
+        <button class="btn-secondary" onclick="saveDesignPrefs()" style="margin-top:6px;width:100%">Save package defaults</button>
+      </div>
+
       <button class="btn-danger" onclick="clearHistory()" title="Clear conversation history (keeps circuit)">Reset Conversation</button>
     </section>
   </aside>
@@ -117,6 +130,7 @@
         <span id="zoom-label">100%</span>
         <button type="button" onclick="zoomIn()" title="Zoom in">+</button>
         <button type="button" onclick="zoomReset()" title="Fit to panel">Fit</button>
+        <button type="button" id="svg-expand-btn" onclick="toggleSvgExpand()" title="Expand schematic to ¾ width">¾</button>
         <button type="button" onclick="downloadSvg()" title="Download SVG">↓ SVG</button>
       </div>
     </div>
@@ -217,6 +231,7 @@ async function selectProject(name) {
   hideMissingAlert();
 
   await refreshStatus();
+  await loadDesignPrefs();
   await refreshSvg();
   await loadBomReport();
 }
@@ -230,6 +245,61 @@ async function refreshStatus() {
   renderTokenBadge(data.token_usage);
   renderFileList('datasheet-list', data.datasheets, '.pdf', `/files/datasheet/${currentProject}`);
   renderFileList('step-list', data.kicad_symbols, '.kicad_sym', `/files/symbol/${currentProject}`);
+}
+
+// ---------------------------------------------------------------------------
+// Design prefs (per-project package defaults)
+// ---------------------------------------------------------------------------
+const PACKAGE_OPTIONS = ['0402', '0603', '0805', '1206', 'SOD-123', 'SOT-23'];
+const PREF_TYPES = [
+  ['resistor', 'pref-resistor'],
+  ['capacitor', 'pref-capacitor'],
+  ['inductor', 'pref-inductor'],
+  ['led', 'pref-led'],
+];
+
+function _fillPackageSelect(sel, value) {
+  const cur = value || '0805';
+  const opts = PACKAGE_OPTIONS.includes(cur) ? PACKAGE_OPTIONS : [cur, ...PACKAGE_OPTIONS];
+  sel.innerHTML = '';
+  for (const opt of opts) {
+    const o = document.createElement('option');
+    o.value = opt;
+    o.textContent = opt;
+    if (opt === cur) o.selected = true;
+    sel.appendChild(o);
+  }
+}
+
+async function loadDesignPrefs() {
+  if (!currentProject) return;
+  const res = await fetch(`/design-prefs/${currentProject}`);
+  const data = res.ok ? await res.json() : {};
+  const pkgs = data.default_packages || {};
+  for (const [type, id] of PREF_TYPES) {
+    const sel = document.getElementById(id);
+    if (sel) _fillPackageSelect(sel, pkgs[type] || (type === 'led' ? '0603' : '0805'));
+  }
+}
+
+async function saveDesignPrefs() {
+  if (!currentProject) return;
+  const default_packages = {};
+  for (const [type, id] of PREF_TYPES) {
+    const sel = document.getElementById(id);
+    if (sel && sel.value) default_packages[type] = sel.value;
+  }
+  const res = await fetch(`/design-prefs/${currentProject}`, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({default_packages}),
+  });
+  const d = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    showMessage('error', d.detail || 'Saving package defaults failed.');
+    return;
+  }
+  showMessage('info', 'Package defaults saved for this project.');
 }
 
 function renderTokenBadge(usage) {
@@ -794,15 +864,55 @@ function setupSvgPan() {
 const RIGHT_PANEL_DEFAULT_W = 420;
 const RIGHT_PANEL_MIN_W = 240;
 const CENTER_PANEL_MIN_W = 220;
+const RIGHT_PANEL_NARROW_FRAC = 0.25;
+const RIGHT_PANEL_WIDE_FRAC = 0.75;
+
+let svgExpanded = false;
+let svgPreExpandWidth = null;
+
+function layoutWidth() {
+  return document.querySelector('.layout').clientWidth;
+}
 
 function setRightPanelWidth(w) {
   const panel = document.getElementById('panel-right');
-  const layout = document.querySelector('.layout');
   const left = document.querySelector('.panel-left');
-  const maxW = layout.clientWidth - left.offsetWidth - CENTER_PANEL_MIN_W;
+  const maxW = layoutWidth() - left.offsetWidth - CENTER_PANEL_MIN_W;
   const clamped = Math.max(RIGHT_PANEL_MIN_W, Math.min(w, Math.max(RIGHT_PANEL_MIN_W, maxW)));
   panel.style.width = `${clamped}px`;
   return clamped;
+}
+
+function updateExpandButton() {
+  const btn = document.getElementById('svg-expand-btn');
+  if (!btn) return;
+  if (svgExpanded) {
+    btn.textContent = '¼';
+    btn.title = 'Shrink schematic to ¼ width';
+    btn.classList.add('active');
+  } else {
+    btn.textContent = '¾';
+    btn.title = 'Expand schematic to ¾ width';
+    btn.classList.remove('active');
+  }
+}
+
+function toggleSvgExpand() {
+  const panel = document.getElementById('panel-right');
+  if (!svgExpanded) {
+    svgPreExpandWidth = Math.round(panel.getBoundingClientRect().width);
+    setRightPanelWidth(layoutWidth() * RIGHT_PANEL_WIDE_FRAC);
+    svgExpanded = true;
+  } else {
+    const restore = svgPreExpandWidth != null
+      ? svgPreExpandWidth
+      : layoutWidth() * RIGHT_PANEL_NARROW_FRAC;
+    setRightPanelWidth(restore);
+    svgPreExpandWidth = null;
+    svgExpanded = false;
+    localStorage.setItem('rightPanelWidth', String(Math.round(panel.getBoundingClientRect().width)));
+  }
+  updateExpandButton();
 }
 
 function setupPanelResizer() {
@@ -838,16 +948,30 @@ function setupPanelResizer() {
     dragging = false;
     resizer.classList.remove('active');
     document.body.classList.remove('resizing');
+    if (svgExpanded) {
+      svgExpanded = false;
+      svgPreExpandWidth = null;
+      updateExpandButton();
+    }
     localStorage.setItem('rightPanelWidth', String(Math.round(panel.getBoundingClientRect().width)));
   });
 
   resizer.addEventListener('dblclick', (e) => {
     e.preventDefault();
+    svgExpanded = false;
+    svgPreExpandWidth = null;
     setRightPanelWidth(RIGHT_PANEL_DEFAULT_W);
     localStorage.removeItem('rightPanelWidth');
+    updateExpandButton();
   });
 
-  window.addEventListener('resize', () => setRightPanelWidth(panel.getBoundingClientRect().width));
+  window.addEventListener('resize', () => {
+    if (svgExpanded) {
+      setRightPanelWidth(layoutWidth() * RIGHT_PANEL_WIDE_FRAC);
+    } else {
+      setRightPanelWidth(panel.getBoundingClientRect().width);
+    }
+  });
 }
 
 // ---------------------------------------------------------------------------

@@ -10,6 +10,7 @@ Each project lives at projects/<name>/ and contains:
   schematic.svg     — latest generated SVG schematic
   bom_report.json   — results of the last BOM import (per-part fetch status)
   part_descriptions.json — user's description of the board and what each main part does
+  design_prefs.json — per-project package/size defaults for common parts
   token_usage.json  — cumulative Claude API token usage for the project
 """
 
@@ -18,6 +19,17 @@ from dataclasses import dataclass
 from pathlib import Path
 
 BASE_DIR = Path("projects")
+
+# Used when a project has no design_prefs.json yet (and as the API default).
+DEFAULT_DESIGN_PREFS: dict = {
+    "default_packages": {
+        "resistor": "0805",
+        "capacitor": "0805",
+        "inductor": "0805",
+        "led": "0603",
+        "diode": "SOD-123",
+    },
+}
 
 
 @dataclass
@@ -32,6 +44,7 @@ class Project:
     svg_path: Path
     bom_report_path: Path
     part_descriptions_path: Path
+    design_prefs_path: Path
     token_usage_path: Path
 
 
@@ -48,6 +61,7 @@ def _make_project(name: str) -> Project:
         svg_path=root / "schematic.svg",
         bom_report_path=root / "bom_report.json",
         part_descriptions_path=root / "part_descriptions.json",
+        design_prefs_path=root / "design_prefs.json",
         token_usage_path=root / "token_usage.json",
     )
 
@@ -170,6 +184,59 @@ def read_part_descriptions(project: Project) -> dict | None:
 
 def write_part_descriptions(project: Project, data: dict) -> None:
     project.part_descriptions_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def read_design_prefs(project: Project) -> dict:
+    """Return design prefs, falling back to DEFAULT_DESIGN_PREFS when missing/invalid."""
+    prefs = json.loads(json.dumps(DEFAULT_DESIGN_PREFS))  # deep copy
+    if not project.design_prefs_path.exists():
+        return prefs
+    try:
+        saved = json.loads(project.design_prefs_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return prefs
+    packages = saved.get("default_packages")
+    if isinstance(packages, dict):
+        for key, val in packages.items():
+            if isinstance(key, str) and isinstance(val, str) and key.strip() and val.strip():
+                prefs["default_packages"][key.strip().lower()] = val.strip()
+    return prefs
+
+
+def write_design_prefs(project: Project, data: dict) -> dict:
+    """Normalize and persist design prefs; return the stored form."""
+    packages: dict[str, str] = {}
+    raw = data.get("default_packages") if isinstance(data, dict) else None
+    if isinstance(raw, dict):
+        for key, val in raw.items():
+            if isinstance(key, str) and isinstance(val, str) and key.strip() and val.strip():
+                packages[key.strip().lower()] = val.strip()
+    if not packages:
+        packages = dict(DEFAULT_DESIGN_PREFS["default_packages"])
+    stored = {"default_packages": packages}
+    project.design_prefs_path.write_text(json.dumps(stored, indent=2), encoding="utf-8")
+    return stored
+
+
+def apply_package_prefs(circuit: dict, prefs: dict | None) -> None:
+    """Fill missing component footprints from type → package prefs (in place)."""
+    packages = (prefs or {}).get("default_packages") or {}
+    if not packages:
+        return
+    # Longer type keys first so "capacitor" beats "cap" if both exist.
+    rules = sorted(
+        ((k.lower(), v) for k, v in packages.items() if k and v),
+        key=lambda kv: len(kv[0]),
+        reverse=True,
+    )
+    for comp in circuit.get("components") or []:
+        if str(comp.get("footprint") or "").strip():
+            continue
+        t = (comp.get("type") or "").lower()
+        for key, pkg in rules:
+            if key in t or t in key:
+                comp["footprint"] = pkg
+                break
 
 
 def read_token_usage(project: Project) -> dict:

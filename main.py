@@ -74,6 +74,10 @@ class PartDescriptionsRequest(BaseModel):
     parts: dict[str, str] = {}   # MPN -> what the part does in this design
 
 
+class DesignPrefsRequest(BaseModel):
+    default_packages: dict[str, str] = {}  # type -> package, e.g. resistor -> 0805
+
+
 class PromptResponse(BaseModel):
     status: str                 # "ok" | "missing_datasheets" | "error"
     missing_parts: list[str]    # populated when status == "missing_datasheets"
@@ -190,6 +194,7 @@ async def process_prompt(req: PromptRequest):
 
     # Call Claude
     try:
+        design_prefs = project_manager.read_design_prefs(project)
         circuit_dict, context_md, recreate_md = circuit_designer.design_step(
             project_name=req.project_name,
             user_prompt=prompt,
@@ -197,9 +202,11 @@ async def process_prompt(req: PromptRequest):
             kicad_symbols=kicad_data,
             existing_circuit=existing_circuit,
             design_intent=_design_intent(project),
+            design_prefs=design_prefs,
             on_usage=lambda i, o, cr, cw: project_manager.add_token_usage(project, i, o, cr, cw),
             model=req.model,
         )
+        project_manager.apply_package_prefs(circuit_dict, design_prefs)
     except EnvironmentError as e:
         raise HTTPException(status_code=500, detail=str(e))
     except ValueError as e:
@@ -627,6 +634,31 @@ async def save_part_descriptions(project_name: str, req: PartDescriptionsRequest
     }
     project_manager.write_part_descriptions(project, data)
     return data
+
+
+@app.get("/design-prefs/{project_name}")
+async def get_design_prefs(project_name: str):
+    """Return per-project package defaults (with built-in fallbacks if never saved)."""
+    try:
+        project = project_manager.open_project(project_name)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    prefs = project_manager.read_design_prefs(project)
+    return {**prefs, "saved": project.design_prefs_path.exists()}
+
+
+@app.post("/design-prefs/{project_name}")
+async def save_design_prefs(project_name: str, req: DesignPrefsRequest):
+    """Save package defaults for common part types; applied on every design turn."""
+    try:
+        project = project_manager.open_project(project_name)
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    return project_manager.write_design_prefs(
+        project, {"default_packages": req.default_packages}
+    )
 
 
 # ---------------------------------------------------------------------------

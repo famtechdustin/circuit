@@ -87,6 +87,10 @@ header h1 {
   width: 420px;
   min-width: 240px;
   flex-shrink: 0;
+  transition: width 0.2s ease;
+}
+body.resizing .panel-right {
+  transition: none;
 }
 
 .panel-resizer {
@@ -427,6 +431,11 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 }
 
 .svg-controls button:hover { background: #cbd5e1; }
+.svg-controls button.active {
+  background: #3b82f6;
+  color: #fff;
+  border-color: #2563eb;
+}
 
 #zoom-label {
   min-width: 44px;
@@ -612,6 +621,41 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 .canvas-size-row input[type="number"] {
   width: 68px;
   padding: 3px 5px;
+  font-size: 11px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--surface);
+  color: var(--text);
+}
+
+.design-prefs {
+  margin: 10px 0 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+.design-prefs h3 {
+  font-size: 12px;
+  font-weight: 600;
+  margin-bottom: 2px;
+}
+.prefs-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px 8px;
+  margin-top: 6px;
+}
+.prefs-grid label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-family: var(--mono);
+  color: var(--text-muted);
+}
+.prefs-grid select {
+  flex: 1;
+  min-width: 0;
+  padding: 2px 4px;
   font-size: 11px;
   border: 1px solid var(--border);
   border-radius: 4px;

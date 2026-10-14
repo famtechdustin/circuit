@@ -73,9 +73,9 @@ The JSON must match this structure exactly:
       "name": "10k Pull-up",
       "type": "resistor",
       "value": "10k",
-      "footprint": "0402",
+      "footprint": "0805",
       "position": {"x": 200, "y": 150},
-      "bounding_box": {"width": 60, "height": 45},
+      "bounding_box": {"width": 40, "height": 28},
       "supports": {"component_id": "U1", "pin_number": 3},
       "pins": [
         {"number": 1, "name": "A", "direction": "passive", "side": "left", "offset": 0.5},
@@ -119,13 +119,18 @@ The JSON must match this structure exactly:
 - pin.offset is 0.0–1.0 (fractional position along that edge); distribute pins evenly.
 - pin.direction must be one of: "input", "output", "bidirectional", "passive",
   "power_in", "power_out", "open_collector", "no_connect"
-- Default bounding_box sizes:
-    resistor/capacitor/diode/ferrite/inductor (2-pin): {"width": 70, "height": 45}
+- Default bounding_box sizes (keep 2-pin passives compact — standard schematic scale):
+    resistor/capacitor/diode/ferrite/inductor/led (2-pin): {"width": 40, "height": 28}
     DIP IC (≤16 pins): {"width": 120, "height": <pin_count * 12>}
     DIP IC (>16 pins): {"width": 140, "height": <pin_count * 12>}
     QFP/QFN IC: {"width": 160, "height": 160}
     connector: {"width": 70, "height": <pin_count * 18>}
-    transistor: {"width": 70, "height": 70}
+    transistor / MOSFET (3-pin): {"width": 70, "height": 70}
+      Prefer type strings that select the right glyph: "nmos", "pmos",
+      "npn", "pnp" (or "n-mosfet", "pnp transistor", etc.).
+- footprint: use the project's package defaults from [DESIGN_PREFS] for common
+  passives (resistor/capacitor/inductor/led/diode). If no prefs are given,
+  default resistor/capacitor/inductor to "0805" and led to "0603".
 - Canvas is 2000 × 1400 px. Spread primary components across it generously.
 - Keep positions non-overlapping; space primary (non-support) components
   220–320 px apart. Support parts are exempt — place them adjacent to the
@@ -178,6 +183,19 @@ When the user has described the board and the role of its main parts, it appears
 Treat this as the authoritative statement of what each part is for. Use it to decide
 how parts connect to each other and which datasheet application circuits apply.
 
+## Design prefs (package defaults)
+
+When present, project package preferences appear as:
+  [DESIGN_PREFS]
+  default_packages:
+    resistor: 0805
+    capacitor: 0805
+    ...
+  [/DESIGN_PREFS]
+
+Set each matching component's "footprint" field to that package unless the user
+explicitly requests a different size for a specific part.
+
 ## Missing datasheets
 
 If your design requires a part whose datasheet was NOT provided in the reference material,
@@ -201,6 +219,7 @@ def design_step(
     kicad_symbols: dict[str, list],
     existing_circuit: dict | None,
     design_intent: dict | None = None,
+    design_prefs: dict | None = None,
     on_usage: Callable[[int, int, int, int], None] | None = None,
     model: str | None = None,
 ) -> tuple[dict, str, str]:
@@ -208,6 +227,7 @@ def design_step(
     Run one design turn for the given project.
 
     design_intent: {"overview": str, "parts": [{"mpn", "refdes", "description"}]}
+    design_prefs: {"default_packages": {"resistor": "0805", ...}}
     model: one of MODELS; defaults to MODEL.
     on_usage: called with (input_tokens, output_tokens, cache_read_tokens,
               cache_write_tokens) once Claude responds, before parsing, so usage
@@ -226,7 +246,9 @@ def design_step(
     # stable content goes first — system prompt, then project reference
     # material, then prior turns — and the per-turn message last.
     system = [{"type": "text", "text": SYSTEM_PROMPT, "cache_control": CACHE}]
-    reference = _build_reference_block(datasheet_texts, kicad_symbols, design_intent)
+    reference = _build_reference_block(
+        datasheet_texts, kicad_symbols, design_intent, design_prefs
+    )
     if reference:
         system.append({"type": "text", "text": reference, "cache_control": CACHE})
 
@@ -334,6 +356,7 @@ def _build_reference_block(
     datasheet_texts: dict[str, str],
     kicad_symbols: dict[str, list],
     design_intent: dict | None = None,
+    design_prefs: dict | None = None,
 ) -> str:
     """Project reference material. Must be deterministic so it stays cacheable."""
     parts = []
@@ -347,6 +370,15 @@ def _build_reference_block(
             lines.append(f"- {p['mpn']}{refs}: {p['description']}")
         lines.append("[/DESIGN_INTENT]")
         parts.append("\n## Design intent (from user)\n")
+        parts.append("\n".join(lines))
+
+    packages = (design_prefs or {}).get("default_packages") or {}
+    if packages:
+        lines = ["[DESIGN_PREFS]", "default_packages:"]
+        for key in sorted(packages):
+            lines.append(f"  {key}: {packages[key]}")
+        lines.append("[/DESIGN_PREFS]")
+        parts.append("\n## Design prefs (package defaults)\n")
         parts.append("\n".join(lines))
 
     if datasheet_texts:
