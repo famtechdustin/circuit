@@ -352,8 +352,8 @@ def _bom_by_refdes(bom_rows: list[dict] | None) -> dict[str, dict]:
     return out
 
 
-# member: (part, pin_name, (x, y), side)  — coords in grid steps, y downward
-_Member = tuple[str, str, tuple[int, int], str]
+# member: (part, pin_name, tip, side, lane) — coords in grid steps, y downward
+_Member = tuple[str, str, tuple[int, int], str, tuple[int, int]]
 _Wire = tuple[int, int, int, int]  # x1, y1, x2, y2 in grid steps
 _Pt = tuple[int, int]
 _RectI = tuple[int, int, int, int]  # x1, y1, x2, y2 body obstacle
@@ -361,13 +361,25 @@ _RectI = tuple[int, int, int, int]  # x1, y1, x2, y2 body obstacle
 _STUB_DIR = {"left": (-1, 0), "right": (1, 0), "top": (0, -1), "bottom": (0, 1)}
 _WIRE_W = "0.1524"
 _NET_LAYER = "91"
-_ROUTE_PASSES = 3
+_ROUTE_PASSES = 4
 _BODY_PAD = 1  # grid steps of clearance around foreign component bodies
+_MAX_LANES = 6  # cycle breakout depth like SVG (unique columns per pin)
+_LANE_STEP = 1  # grid steps between successive pin lanes
 
 
-def _lane_exit(x: int, y: int, side: str) -> _Pt:
+def _lane_exit(x: int, y: int, side: str, lane_idx: int = 0) -> _Pt:
+    """
+    Breakout point beyond the pin tip. Depth varies by ``lane_idx`` so pins on
+    the same side do not share a routing column (matches SVG LANE_STEP).
+    """
     dx, dy = _STUB_DIR.get(side, (1, 0))
-    return (x + dx * STUB_LEN, y + dy * STUB_LEN)
+    depth = STUB_LEN + (lane_idx % _MAX_LANES) * _LANE_STEP
+    return (x + dx * depth, y + dy * depth)
+
+
+def _member_tip_lane(m: _Member) -> tuple[_Pt, _Pt]:
+    _, _, tip, _, lane = m
+    return tip, lane
 
 
 def _add_seg(wires: list[_Wire], a: _Pt, b: _Pt) -> None:
@@ -382,6 +394,42 @@ def _add_seg(wires: list[_Wire], a: _Pt, b: _Pt) -> None:
     # Should not happen for Manhattan paths; force L via horizontal first.
     wires.append((ax, ay, bx, ay))
     wires.append((bx, ay, bx, by))
+
+
+def _coalesce_wires(wires: list[_Wire]) -> list[_Wire]:
+    """
+    Merge colinear overlapping/touching segments so fallback detours that
+    retrace a stub do not emit doubled traces into DipTrace.
+    """
+    h: dict[int, list[tuple[int, int]]] = {}
+    v: dict[int, list[tuple[int, int]]] = {}
+    for x1, y1, x2, y2 in wires:
+        if y1 == y2 and x1 != x2:
+            h.setdefault(y1, []).append((min(x1, x2), max(x1, x2)))
+        elif x1 == x2 and y1 != y2:
+            v.setdefault(x1, []).append((min(y1, y2), max(y1, y2)))
+
+    def merge_runs(runs: list[tuple[int, int]]) -> list[tuple[int, int]]:
+        if not runs:
+            return []
+        runs = sorted(runs)
+        out = [runs[0]]
+        for a, b in runs[1:]:
+            la, lb = out[-1]
+            if a <= lb:  # touch or overlap
+                out[-1] = (la, max(lb, b))
+            else:
+                out.append((a, b))
+        return out
+
+    merged: list[_Wire] = []
+    for y, runs in sorted(h.items()):
+        for a, b in merge_runs(runs):
+            merged.append((a, y, b, y))
+    for x, runs in sorted(v.items()):
+        for a, b in merge_runs(runs):
+            merged.append((x, a, x, b))
+    return merged
 
 
 def _h_hits_rect(y: int, x1: int, x2: int, rect: _RectI) -> bool:
@@ -469,8 +517,12 @@ class _GridRouter:
             return []
         ax, ay = a
         bx, by = b
+        candidates: list[list[_Wire]] = []
 
-        def try_wires(cand: list[_Wire]) -> list[_Wire] | None:
+        def consider(cand: list[_Wire]) -> list[_Wire] | None:
+            if not cand:
+                return None
+            candidates.append(cand)
             if self.path_ok(cand, obstacles):
                 self.register(cand)
                 return cand
@@ -480,7 +532,7 @@ class _GridRouter:
         if ay == by or ax == bx:
             direct: list[_Wire] = []
             _add_seg(direct, a, b)
-            got = try_wires(direct)
+            got = consider(direct)
             if got is not None:
                 return got
             for k in range(1, max_tries + 1):
@@ -496,13 +548,10 @@ class _GridRouter:
                         _add_seg(detour, a, (mx, ay))
                         _add_seg(detour, (mx, ay), (mx, by))
                         _add_seg(detour, (mx, by), b)
-                    got = try_wires(detour)
+                    got = consider(detour)
                     if got is not None:
                         return got
-            fallback: list[_Wire] = []
-            _add_seg(fallback, a, b)
-            self.register(fallback)
-            return fallback
+            return self._pick_fallback(candidates, obstacles)
 
         offsets = [0]
         for k in range(1, max_tries):
@@ -513,11 +562,11 @@ class _GridRouter:
         base_my = (ay + by) // 2
         for off in offsets:
             mx = base_mx + off
-            cand = []
+            cand: list[_Wire] = []
             _add_seg(cand, a, (mx, ay))
             _add_seg(cand, (mx, ay), (mx, by))
             _add_seg(cand, (mx, by), b)
-            got = try_wires(cand)
+            got = consider(cand)
             if got is not None:
                 return got
 
@@ -526,7 +575,7 @@ class _GridRouter:
             _add_seg(cand, a, (ax, my))
             _add_seg(cand, (ax, my), (bx, my))
             _add_seg(cand, (bx, my), b)
-            got = try_wires(cand)
+            got = consider(cand)
             if got is not None:
                 return got
 
@@ -544,15 +593,30 @@ class _GridRouter:
                 _add_seg(cand, a, via[0])
                 _add_seg(cand, via[0], via[1])
                 _add_seg(cand, via[1], b)
-                got = try_wires(cand)
+                got = consider(cand)
                 if got is not None:
                     return got
 
-        fallback = []
-        _add_seg(fallback, a, (bx, ay))
-        _add_seg(fallback, (bx, ay), b)
-        self.register(fallback)
-        return fallback
+        return self._pick_fallback(candidates, obstacles)
+
+    def _pick_fallback(
+        self, candidates: list[list[_Wire]], obstacles: list[_RectI],
+    ) -> list[_Wire]:
+        """Choose the least-bad path when no fully clear route exists."""
+        if not candidates:
+            return []
+
+        def score(cand: list[_Wire]) -> tuple[int, int, int]:
+            body_hits = 1 if (obstacles and _wires_hit_obstacles(cand, obstacles)) else 0
+            wire_hits = 1 if self._wires_conflict(cand) else 0
+            length = sum(
+                abs(x2 - x1) + abs(y2 - y1) for x1, y1, x2, y2 in cand
+            )
+            return (body_hits + wire_hits, wire_hits, length)
+
+        best = min(candidates, key=score)
+        self.register(best)
+        return best
 
 
 def _route_two_pin(
@@ -563,15 +627,13 @@ def _route_two_pin(
     max_tries: int = 12,
 ) -> list[_Wire]:
     """Stub out from each pin tip, then Manhattan between lane exits."""
-    _, _, (x1, y1), side1 = m1
-    _, _, (x2, y2), side2 = m2
-    lane1 = _lane_exit(x1, y1, side1)
-    lane2 = _lane_exit(x2, y2, side2)
+    tip1, lane1 = _member_tip_lane(m1)
+    tip2, lane2 = _member_tip_lane(m2)
     wires: list[_Wire] = []
     stubs: list[_Wire] = []
-    _add_seg(stubs, (x1, y1), lane1)
-    _add_seg(stubs, lane2, (x2, y2))
-    # Stubs are short breakouts; register them then route between lanes
+    _add_seg(stubs, tip1, lane1)
+    _add_seg(stubs, lane2, tip2)
+    # Stubs are usually pre-registered; re-register is idempotent for conflict checks
     router.register(stubs)
     mid = router.manhattan(lane1, lane2, obstacles, max_tries=max_tries)
     wires.extend(stubs)
@@ -588,64 +650,68 @@ def _trunk_route(
 ) -> tuple[list[_Wire], list[_Pt]]:
     """
     Horizontal trunk with stubs from each pin tip via its lane exit.
-    Chooses a clear trunk_y when not forced (power rails).
+    ``trunk_y`` is a preferred Y (e.g. power rail); always searches nearby
+    offsets when that Y is blocked by wires or bodies.
     Returns (wires, junction points on the trunk).
     """
     if not members:
         return [], []
 
-    lanes: list[_Pt] = []
     tips: list[_Pt] = []
-    for _, _, (x, y), side in members:
-        tips.append((x, y))
-        lanes.append(_lane_exit(x, y, side))
+    lanes: list[_Pt] = []
+    for m in members:
+        tip, lane = _member_tip_lane(m)
+        tips.append(tip)
+        lanes.append(lane)
 
     trunk_xs = sorted({lx for lx, _ in lanes})
     x0, x1 = trunk_xs[0], trunk_xs[-1]
 
-    if trunk_y is None:
-        ys = sorted(ly for _, ly in lanes)
-        base = ys[len(ys) // 2]
-        chosen = base
-        for k in range(max_tries):
-            for ty in ([base] if k == 0 else [base + k, base - k]):
-                trunk_w: list[_Wire] = []
-                if x0 != x1:
-                    _add_seg(trunk_w, (x0, ty), (x1, ty))
-                branch_ok = True
-                branches: list[_Wire] = []
-                for lx, ly in lanes:
-                    br: list[_Wire] = []
-                    _add_seg(br, (lx, ly), (lx, ty))
-                    if not router.path_ok(br, obstacles):
-                        branch_ok = False
-                        break
-                    branches.extend(br)
-                if not branch_ok:
-                    continue
-                if trunk_w and not router.path_ok(trunk_w, obstacles):
-                    continue
-                chosen = ty
-                break
-            else:
+    ys = sorted(ly for _, ly in lanes)
+    base = trunk_y if trunk_y is not None else ys[len(ys) // 2]
+    chosen = base
+    for k in range(max_tries):
+        candidates = [base] if k == 0 else [base + k, base - k]
+        found = False
+        for ty in candidates:
+            trunk_w: list[_Wire] = []
+            if x0 != x1:
+                _add_seg(trunk_w, (x0, ty), (x1, ty))
+            branch_ok = True
+            for lx, ly in lanes:
+                br: list[_Wire] = []
+                _add_seg(br, (lx, ly), (lx, ty))
+                if br and not router.path_ok(br, obstacles):
+                    branch_ok = False
+                    break
+            if not branch_ok:
                 continue
+            if trunk_w and not router.path_ok(trunk_w, obstacles):
+                continue
+            chosen = ty
+            found = True
             break
-        trunk_y = chosen
+        if found:
+            break
+    trunk_y = chosen
 
     wires: list[_Wire] = []
     junctions: list[_Pt] = []
+    mid: list[_Wire] = []
 
     for tip, lane in zip(tips, lanes):
         lx, ly = lane
         _add_seg(wires, tip, lane)
         join = (lx, trunk_y)
-        _add_seg(wires, lane, join)
+        _add_seg(mid, lane, join)
         junctions.append(join)
 
     if len(trunk_xs) >= 2:
-        _add_seg(wires, (trunk_xs[0], trunk_y), (trunk_xs[-1], trunk_y))
+        _add_seg(mid, (trunk_xs[0], trunk_y), (trunk_xs[-1], trunk_y))
 
-    router.register(wires)
+    # Stubs already reserved; register branches + trunk only
+    router.register(mid)
+    wires.extend(mid)
 
     if len(members) < 3:
         junctions = []
@@ -667,9 +733,11 @@ def _power_trunk_y(
 
     ymin = min(all_tips_y) if all_tips_y else 0
     vcc_u = sorted(r.upper() for r in power_rails if not svg_generator._is_gnd_net(r))
+    # Keep rails above deepest breakout lanes
     spacing = 4  # grid steps between parallel rails
+    lane_clear = STUB_LEN + _MAX_LANES * _LANE_STEP + 2
     if upper in vcc_u:
-        return ymin - STUB_LEN - 2 - vcc_u.index(upper) * spacing
+        return ymin - lane_clear - vcc_u.index(upper) * spacing
     return None
 
 
@@ -739,18 +807,19 @@ def _emit_gnd_local_net(
     its own ground-supply instance (no shared ground bar).
     """
     net_el = _sub(nets_el, "net", name=name, class_="0")
-    for i, (part, pin, (x, y), side) in enumerate(members, start=1):
+    for i, (part, pin, tip, side, lane) in enumerate(members, start=1):
         gnd_part = _ident(f"{deviceset}_{part}_{i}", f"GND{i}")
         _sub(parts, "part", name=gnd_part, library=LIB, deviceset=deviceset,
              device="", value=name)
-        lx, ly = _lane_exit(x, y, side)
+        lx, ly = lane
         _sub(instances, "instance", part=gnd_part, gate=GATE,
              x=_mm(lx), y=_mm(-ly), rot=_SUPPLY_ROT.get(side, "R0"))
 
         seg = _sub(net_el, "segment")
         _sub(seg, "pinref", part=part, gate=GATE, pin=pin)
         _sub(seg, "pinref", part=gnd_part, gate=GATE, pin=pin_name)
-        _write_wires(seg, [(x, y, lx, ly)] if (x, y) != (lx, ly) else [])
+        x, y = tip
+        _write_wires(seg, [(x, y, lx, ly)] if tip != lane else [])
 
 
 def _write_wires(seg: ET.Element, wires: list[_Wire]) -> None:
@@ -765,8 +834,18 @@ def _body_rects_for_parts(
     members: list[_Member],
 ) -> list[_RectI]:
     """Obstacle rects for component bodies this net does not attach to."""
-    attached = {part for part, _, _, _ in members}
+    attached = {part for part, *_ in members}
     return [rect for part, rect in part_bodies.items() if part not in attached]
+
+
+def _preregister_stubs(router: _GridRouter, jobs: list[dict]) -> None:
+    """Reserve tip→lane breakouts so mid-routes cannot run over them."""
+    stubs: list[_Wire] = []
+    for job in jobs:
+        for m in job["members"]:
+            tip, lane = _member_tip_lane(m)
+            _add_seg(stubs, tip, lane)
+    router.register(stubs)
 
 
 def _route_net_wires(
@@ -781,34 +860,53 @@ def _route_net_wires(
     Returns (wires, junctions, label_at).
     """
     if len(members) == 1:
-        _, _, (x, y), side = members[0]
-        lane = _lane_exit(x, y, side)
+        tip, lane = _member_tip_lane(members[0])
         wires: list[_Wire] = []
-        _add_seg(wires, (x, y), lane)
+        _add_seg(wires, tip, lane)
         router.register(wires)
-        return wires, [], lane
+        return _coalesce_wires(wires), [], lane
 
     if len(members) == 2 and trunk_y is None:
         wires = _route_two_pin(
             members[0], members[1], router, obstacles, max_tries=max_tries,
         )
-        _, _, (x1, y1), s1 = members[0]
-        _, _, (x2, y2), s2 = members[1]
-        l1 = _lane_exit(x1, y1, s1)
-        l2 = _lane_exit(x2, y2, s2)
-        return wires, [], ((l1[0] + l2[0]) // 2, (l1[1] + l2[1]) // 2)
+        _, lane1 = _member_tip_lane(members[0])
+        _, lane2 = _member_tip_lane(members[1])
+        return (
+            _coalesce_wires(wires), [],
+            ((lane1[0] + lane2[0]) // 2, (lane1[1] + lane2[1]) // 2),
+        )
 
     wires, junctions = _trunk_route(
-        members, router, obstacles, trunk_y=trunk_y, max_tries=max_tries + 8,
+        members, router, obstacles, trunk_y=trunk_y, max_tries=max_tries + 10,
     )
     xs = [m[2][0] for m in members]
-    ty = trunk_y if trunk_y is not None else (
-        sorted(_lane_exit(*m[2], m[3])[1] for m in members)[len(members) // 2]
+    ty = junctions[0][1] if junctions else (
+        trunk_y if trunk_y is not None else
+        sorted(m[4][1] for m in members)[len(members) // 2]
     )
-    # Prefer actual trunk Y from a junction if present
-    if junctions:
-        ty = junctions[0][1]
-    return wires, junctions, ((min(xs) + max(xs)) // 2, ty)
+    return _coalesce_wires(wires), junctions, ((min(xs) + max(xs)) // 2, ty)
+
+
+def _net_span_eagle(job: dict) -> int:
+    """Rough geometric span — longer nets get priority on the final pass."""
+    lanes = [m[4] for m in job["members"]]
+    xs = [x for x, _ in lanes]
+    ys = [y for _, y in lanes]
+    return (max(xs) - min(xs)) + (max(ys) - min(ys))
+
+
+def _wires_conflict_others(
+    results: list[tuple[list[_Wire], list[_Pt], _Pt]],
+    index: int,
+) -> bool:
+    """True if net ``index`` still overlaps another net's colinear segments."""
+    router = _GridRouter()
+    for j, (wires, _, _) in enumerate(results):
+        if j == index:
+            continue
+        router.register(wires)
+    return router._wires_conflict(results[index][0])
 
 
 def _multi_pass_route_eagle(
@@ -832,12 +930,15 @@ def _multi_pass_route_eagle(
 
     for pass_i in range(passes):
         router = _GridRouter()
-        max_tries = 12 + pass_i * 4
+        _preregister_stubs(router, jobs)
+        max_tries = 12 + pass_i * 6
         dirty_list = sorted(dirty)
         clean = [i for i in range(n) if i not in dirty]
         if pass_i % 2 == 1:
             dirty_list = list(reversed(dirty_list))
             clean = list(reversed(clean))
+        if pass_i == passes - 1:
+            dirty_list = sorted(dirty_list, key=lambda i: -_net_span_eagle(jobs[i]))
         order = dirty_list + clean
 
         new_results: list[tuple[list[_Wire], list[_Pt], _Pt] | None] = [None] * n
@@ -859,6 +960,9 @@ def _multi_pass_route_eagle(
             obstacles = _body_rects_for_parts(part_bodies, job["members"])
             if obstacles and _wires_hit_obstacles(wires, obstacles):
                 dirty.add(i)
+                continue
+            if _wires_conflict_others(results, i):
+                dirty.add(i)
 
     return results
 
@@ -878,7 +982,7 @@ def _emit_net(
     net_el = _sub(nets_el, "net", name=name, class_="0")
     seg = _sub(net_el, "segment")
 
-    for part, pin_name, _, _ in members:
+    for part, pin_name, *_ in members:
         _sub(seg, "pinref", part=part, gate=GATE, pin=pin_name)
 
     _write_wires(seg, wires)
@@ -931,8 +1035,8 @@ def generate_eagle_sch(circuit: dict, bom_rows: list[dict] | None = None) -> str
     nets_el = _sub(sheet, "nets")
 
     package_pads: dict[str, tuple[str, ...]] = {}
-    # (component_id, pin_number) -> (part, pin name, absolute tip, side)
-    pin_index: dict[tuple[str, str], tuple[str, str, tuple[int, int], str]] = {}
+    # (component_id, pin_number) -> _Member (part, pin, tip, side, lane)
+    pin_index: dict[tuple[str, str], _Member] = {}
     # part name -> body rect in grid steps (obstacle for foreign nets)
     part_bodies: dict[str, _RectI] = {}
 
@@ -981,9 +1085,11 @@ def generate_eagle_sch(circuit: dict, bom_rows: list[dict] | None = None) -> str
             ox + w + _BODY_PAD, oy + h + _BODY_PAD,
         )
 
-        for p in pins:
+        for lane_idx, p in enumerate(pins):
             tx, ty = p["tip"]
-            pin_index[(cid, p["number"])] = (part, p["name"], (ox + tx, oy + ty), p["side"])
+            tip = (ox + tx, oy + ty)
+            lane = _lane_exit(*tip, p["side"], lane_idx=lane_idx)
+            pin_index[(cid, p["number"])] = (part, p["name"], tip, p["side"], lane)
 
     power_rails = set(circuit.get("power_rails", []) or [])
     # Case-insensitive set of ground rail names present in this circuit
@@ -999,7 +1105,7 @@ def generate_eagle_sch(circuit: dict, bom_rows: list[dict] | None = None) -> str
             if key in pin_index:
                 merged.setdefault(name, []).append(pin_index[key])
 
-    all_tips_y = [tip[1] for _, _, tip, _ in pin_index.values()]
+    all_tips_y = [tip[1] for _, _, tip, _, _ in pin_index.values()]
     gnd_upper = {r.upper() for r in gnd_rail_names}
 
     # GND nets: local symbols (no shared routing). Signal / VCC: multi-pass route.
