@@ -40,12 +40,31 @@ MIN_COMP_H_COMMON = 45   # half of MIN_COMP_H — enough for 2-pin series parts
 # Must cover pin stubs (PIN_STUB) + max lane exit (MAX_LANES * LANE_STEP) + routing room.
 COMP_PADDING = PIN_STUB + MAX_LANES * LANE_STEP + 20   # ≈ 118 px
 BODY_PAD = 6        # px margin around component bodies that wires must not cross
+BODY_CLEARANCE = 8  # min gap between component body boxes (hard non-overlap)
 ROUTE_PASSES = 3    # post-layout clearance / reroute iterations
 RAIL_TOP_START = 35          # Y of topmost VCC-type rail
 RAIL_BOT_START = CANVAS_H - 35  # Y of bottommost GND-type rail
 RAIL_SPACING = 22            # px between stacked rails of same polarity
 SUPPORT_GAP = 50             # px from host pin tip to nearest edge of support body
 SUPPORT_STACK_PAD = 20       # px between stacked supports on the same pin
+
+# Left-side BOM column (refdes + part info)
+BOM_MARGIN = 12              # px inset from SVG left edge
+BOM_TOP = 28                 # px Y of BOM title
+BOM_GAP = 24                 # px between BOM panel and schematic
+BOM_PAD_X = 10               # inner horizontal padding
+BOM_PAD_Y = 8                # inner vertical padding
+BOM_ROW_H = 16               # px per data row
+BOM_HEADER_H = 18            # px header row
+BOM_TITLE_H = 22             # px "BOM" title band
+BOM_FONT = 10
+BOM_HEADER_FONT = 10
+BOM_TITLE_FONT = 12
+BOM_COL_GAP = 12             # px between columns
+BOM_MIN_W = 180
+BOM_FILL = "#ffffff"
+BOM_STROKE = "#99a3b5"
+BOM_HEADER_FILL = "#eef2ff"
 
 SIGNAL_PALETTE_SIZE = 20
 SIGNAL_PALETTE_OFFSET = 7    # shift on each 20-pin cycle (pins 21–40, …)
@@ -724,6 +743,204 @@ class _SegmentRegistry:
         return self._tol
 
 
+# ---------------------------------------------------------------------------
+# Left-side BOM column
+# ---------------------------------------------------------------------------
+
+_REFDES_RE = re.compile(r"^([A-Za-z]+)(\d+)(.*)$")
+
+
+def _refdes_sort_key(ref: str) -> tuple:
+    """Natural sort: R1, R2, R10 (not R1, R10, R2)."""
+    m = _REFDES_RE.match((ref or "").strip())
+    if m:
+        return (m.group(1).upper(), int(m.group(2)), m.group(3))
+    return ((ref or "").upper(), 0, "")
+
+
+def _text_w(text: str, font_size: float) -> float:
+    """Approximate monospace text width in px."""
+    return max(0, len(text or "")) * font_size * 0.62
+
+
+def _build_bom_rows(components: list) -> list[dict]:
+    """
+    One BOM row per component, sorted by RefDes.
+    Fields: refdes, value, name, footprint (empty strings allowed).
+    """
+    rows: list[dict] = []
+    for comp in components:
+        ref = str(comp.get("id", "")).strip()
+        if not ref:
+            continue
+        value = str(comp.get("value") or "").strip()
+        name = str(comp.get("name") or "").strip()
+        # Avoid duplicating value in the name column when they match
+        if name and value and name.lower() == value.lower():
+            name = ""
+        if not name:
+            name = str(comp.get("type") or "").strip()
+        footprint = str(comp.get("footprint") or "").strip()
+        rows.append({
+            "refdes": ref,
+            "value": value,
+            "name": name,
+            "footprint": footprint,
+        })
+    rows.sort(key=lambda r: _refdes_sort_key(r["refdes"]))
+    return rows
+
+
+def _bom_column_widths(rows: list[dict]) -> dict[str, float]:
+    """Pixel widths for RefDes / Value / Name / Footprint columns."""
+    show_fp = any(r.get("footprint") for r in rows)
+    keys = ["refdes", "value", "name"] + (["footprint"] if show_fp else [])
+    headers = {
+        "refdes": "RefDes",
+        "value": "Value",
+        "name": "Description",
+        "footprint": "Footprint",
+    }
+    widths: dict[str, float] = {}
+    for key in keys:
+        w = _text_w(headers[key], BOM_HEADER_FONT)
+        for row in rows:
+            w = max(w, _text_w(str(row.get(key, "")), BOM_FONT))
+        # Small minimums so empty columns don't collapse awkwardly
+        widths[key] = max(w, 36 if key == "refdes" else 28)
+    return widths
+
+
+def _bom_column_size(rows: list[dict]) -> tuple[float, float]:
+    """Return (panel_width, panel_height) for the BOM box."""
+    if not rows:
+        return (0.0, 0.0)
+    widths = _bom_column_widths(rows)
+    inner_w = sum(widths.values()) + BOM_COL_GAP * (len(widths) - 1)
+    panel_w = max(BOM_MIN_W, BOM_PAD_X * 2 + inner_w)
+    panel_h = (
+        BOM_TITLE_H
+        + BOM_HEADER_H
+        + BOM_ROW_H * len(rows)
+        + BOM_PAD_Y * 2
+    )
+    return (panel_w, panel_h)
+
+
+def _draw_bom_column(
+    dwg: svgwrite.Drawing,
+    rows: list[dict],
+    x: float,
+    y: float,
+    width: float,
+) -> None:
+    """Draw a full BOM table (RefDes, Value, Description[, Footprint]) at (x, y)."""
+    if not rows:
+        return
+
+    widths = _bom_column_widths(rows)
+    keys = list(widths.keys())
+    headers = {
+        "refdes": "RefDes",
+        "value": "Value",
+        "name": "Description",
+        "footprint": "Footprint",
+    }
+    panel_h = (
+        BOM_TITLE_H
+        + BOM_HEADER_H
+        + BOM_ROW_H * len(rows)
+        + BOM_PAD_Y * 2
+    )
+
+    group = dwg.add(dwg.g(id="bom"))
+
+    # Panel background
+    group.add(dwg.rect(
+        insert=(x, y),
+        size=(width, panel_h),
+        fill=BOM_FILL,
+        stroke=BOM_STROKE,
+        stroke_width=1,
+        rx=3, ry=3,
+    ))
+
+    # Title band
+    group.add(dwg.rect(
+        insert=(x, y),
+        size=(width, BOM_TITLE_H),
+        fill=BOM_HEADER_FILL,
+        stroke=BOM_STROKE,
+        stroke_width=1,
+        rx=3, ry=3,
+    ))
+    # Cover bottom radii of title band so it meets the body cleanly
+    group.add(dwg.rect(
+        insert=(x, y + BOM_TITLE_H - 4),
+        size=(width, 4),
+        fill=BOM_HEADER_FILL,
+        stroke="none",
+    ))
+    group.add(dwg.text(
+        f"BOM  ({len(rows)})",
+        insert=(x + BOM_PAD_X, y + BOM_TITLE_H * 0.68),
+        font_size=BOM_TITLE_FONT,
+        font_family="monospace",
+        font_weight="bold",
+        fill="#222",
+    ))
+
+    # Column x positions
+    col_x: dict[str, float] = {}
+    cx = x + BOM_PAD_X
+    for key in keys:
+        col_x[key] = cx
+        cx += widths[key] + BOM_COL_GAP
+
+    header_y = y + BOM_TITLE_H + BOM_PAD_Y + BOM_HEADER_FONT
+    for key in keys:
+        group.add(dwg.text(
+            headers[key],
+            insert=(col_x[key], header_y),
+            font_size=BOM_HEADER_FONT,
+            font_family="monospace",
+            font_weight="bold",
+            fill="#445",
+        ))
+
+    # Divider under header
+    div_y = y + BOM_TITLE_H + BOM_PAD_Y + BOM_HEADER_H
+    group.add(dwg.line(
+        start=(x + 4, div_y),
+        end=(x + width - 4, div_y),
+        stroke=BOM_STROKE,
+        stroke_width=0.75,
+    ))
+
+    for i, row in enumerate(rows):
+        ty = div_y + BOM_ROW_H * (i + 0.72)
+        # Subtle zebra striping for long lists
+        if i % 2 == 1:
+            group.add(dwg.rect(
+                insert=(x + 2, div_y + BOM_ROW_H * i),
+                size=(width - 4, BOM_ROW_H),
+                fill="#f3f5fa",
+                stroke="none",
+            ))
+        for key in keys:
+            text = str(row.get(key, "") or "")
+            weight = "bold" if key == "refdes" else "normal"
+            fill = "#222" if key == "refdes" else "#444"
+            group.add(dwg.text(
+                text,
+                insert=(col_x[key], ty),
+                font_size=BOM_FONT,
+                font_family="monospace",
+                font_weight=weight,
+                fill=fill,
+            ))
+
+
 def generate_svg(circuit: dict, min_w: int | None = None, min_h: int | None = None) -> str:
     """
     Convert a circuit dict (matching the JSON schema) to an SVG string.
@@ -741,11 +958,18 @@ def generate_svg(circuit: dict, min_w: int | None = None, min_h: int | None = No
 
     vcc_nets = sorted(n for n in power_rails if not _is_gnd_net(n))
 
+    # BOM column on the left — reserve width before shifting the schematic
+    bom_rows = _build_bom_rows(components)
+    bom_w, bom_h = _bom_column_size(bom_rows)
+    left_margin = COMP_PADDING
+    if bom_rows:
+        left_margin = BOM_MARGIN + bom_w + BOM_GAP + COMP_PADDING
+
     # Shift every component so the layout clears the top/left margins
     top_margin = RAIL_TOP_START + max(1, len(vcc_nets)) * RAIL_SPACING + 50
-    _normalize_to_canvas(components, top_margin=top_margin)
+    _normalize_to_canvas(components, top_margin=top_margin, left_margin=left_margin)
 
-    # Dynamic canvas: grow to fit the actual component footprint
+    # Dynamic canvas: grow to fit the actual component footprint (+ BOM)
     if components:
         _cw = max(c["position"]["x"] + c["bounding_box"]["width"] + COMP_PADDING
                   for c in components)
@@ -753,6 +977,9 @@ def generate_svg(circuit: dict, min_w: int | None = None, min_h: int | None = No
                   for c in components)
     else:
         _cw, _ch = CANVAS_W, CANVAS_H
+    if bom_rows:
+        _cw = max(_cw, BOM_MARGIN + bom_w + BOM_GAP)
+        _ch = max(_ch, BOM_TOP + bom_h)
     canvas_w = max(CANVAS_W, int(_cw) + 10)
     canvas_h = max(CANVAS_H, int(_ch) + 40)  # +40 for title row
     if min_w:
@@ -872,12 +1099,17 @@ def generate_svg(circuit: dict, min_w: int | None = None, min_h: int | None = No
     for comp in components:
         _draw_component(dwg, comp_group, comp)
 
-    # Title block
+    # Full BOM list (refdes + part fields) in a left column
+    if bom_rows:
+        _draw_bom_column(dwg, bom_rows, x=BOM_MARGIN, y=BOM_TOP, width=bom_w)
+
+    # Title block (to the right of the BOM so it stays readable)
     title = circuit.get("metadata", {}).get("title", "Untitled Circuit")
     revision = circuit.get("metadata", {}).get("revision", 1)
+    title_x = (BOM_MARGIN + bom_w + BOM_GAP) if bom_rows else 10
     dwg.add(dwg.text(
         f"{title}  Rev.{revision}",
-        insert=(10, canvas_h - 10),
+        insert=(title_x, canvas_h - 10),
         font_size=12,
         font_family="monospace",
         fill="#666",
@@ -888,18 +1120,80 @@ def generate_svg(circuit: dict, min_w: int | None = None, min_h: int | None = No
     return buf.getvalue()
 
 
+def _body_overlap_xy(ci: dict, cj: dict, gap: float = 0.0) -> tuple[float, float]:
+    """Return (ox, oy) penetration of body boxes expanded by ``gap``/2 each side.
+
+    Positive ox and oy means the boxes collide (including the minimum gap).
+    """
+    pad = gap / 2.0
+    xi, yi = float(ci["position"]["x"]), float(ci["position"]["y"])
+    wi, hi = float(ci["bounding_box"]["width"]), _eff_h(ci)
+    xj, yj = float(cj["position"]["x"]), float(cj["position"]["y"])
+    wj, hj = float(cj["bounding_box"]["width"]), _eff_h(cj)
+    ox = min(xi + wi + pad, xj + wj + pad) - max(xi - pad, xj - pad)
+    oy = min(yi + hi + pad, yj + hj + pad) - max(yi - pad, yj - pad)
+    return ox, oy
+
+
+def _push_apart(
+    move_a: set[str],
+    move_b: set[str],
+    ci: dict,
+    cj: dict,
+    ox: float,
+    oy: float,
+    move_ids,
+) -> None:
+    """Push two move-sets apart along the axis of smaller penetration."""
+    cxi = float(ci["position"]["x"]) + float(ci["bounding_box"]["width"]) / 2
+    cyi = float(ci["position"]["y"]) + _eff_h(ci) / 2
+    cxj = float(cj["position"]["x"]) + float(cj["bounding_box"]["width"]) / 2
+    cyj = float(cj["position"]["y"]) + _eff_h(cj) / 2
+
+    # If only one side moves, give it the full separation.
+    if move_a and move_b:
+        share_a = share_b = 0.5
+    elif move_a:
+        share_a, share_b = 1.0, 0.0
+    else:
+        share_a, share_b = 0.0, 1.0
+
+    if ox <= oy:
+        dist = ox + 1
+        if cxi <= cxj:
+            move_ids(move_a, -dist * share_a, 0)
+            move_ids(move_b, dist * share_b, 0)
+        else:
+            move_ids(move_a, dist * share_a, 0)
+            move_ids(move_b, -dist * share_b, 0)
+    else:
+        dist = oy + 1
+        if cyi <= cyj:
+            move_ids(move_a, 0, -dist * share_a)
+            move_ids(move_b, 0, dist * share_b)
+        else:
+            move_ids(move_a, 0, dist * share_a)
+            move_ids(move_b, 0, -dist * share_b)
+
+
 def _resolve_overlaps(
     components: list,
-    max_iter: int = 60,
+    max_iter: int = 80,
     bonded_pairs: set[frozenset] | None = None,
 ) -> None:
     """
     Iteratively push overlapping component boxes apart (in-place).
 
-    Each component is treated as a rectangle expanded by COMP_PADDING on all
-    sides to account for pin stubs, lane exits, and routing clearance.
-    Host–support bonded pairs are not pushed apart; when either moves against
-    an unrelated part, the whole host+supports cluster moves together.
+    Two passes of rules each iteration:
+      1. Hard body check — every pair of component bodies must stay at least
+         BODY_CLEARANCE apart (including host↔support and sibling supports).
+      2. Routing clearance — unrelated clusters are also kept COMP_PADDING
+         apart for pin stubs / lane exits. Bonded host–support pairs skip this
+         so supports can sit close to their host pin.
+
+    When a support collides with its host, only the support moves. Sibling
+    supports on the same host push each other; unrelated hits move whole
+    host+supports clusters together.
     """
     bonded = bonded_pairs or set()
     support_of, hosts_supports, by_id = _support_host_maps(components)
@@ -911,6 +1205,24 @@ def _resolve_overlaps(
                 m["position"]["x"] += dx
                 m["position"]["y"] += dy
 
+    def _body_move_sets(id_i: str, id_j: str) -> tuple[set[str], set[str]]:
+        """Who moves for a hard body collision between i and j."""
+        # Support vs its own host → only the support moves
+        if support_of.get(id_i) == id_j:
+            return {id_i}, set()
+        if support_of.get(id_j) == id_i:
+            return set(), {id_j}
+        # Sibling supports (same host) → just those two parts
+        hi = support_of.get(id_i)
+        hj = support_of.get(id_j)
+        if hi and hi == hj:
+            return {id_i}, {id_j}
+        # Otherwise move whole clusters
+        return (
+            _cluster_member_ids(id_i, support_of, hosts_supports),
+            _cluster_member_ids(id_j, support_of, hosts_supports),
+        )
+
     for _ in range(max_iter):
         any_moved = False
 
@@ -920,8 +1232,20 @@ def _resolve_overlaps(
                 cj = components[j]
                 id_i = str(ci.get("id", "")).strip()
                 id_j = str(cj.get("id", "")).strip()
+                if not id_i or not id_j:
+                    continue
 
-                if id_i and id_j and frozenset({id_i, id_j}) in bonded:
+                # ── 1. Hard: component body boxes must not overlap ─────────
+                ox, oy = _body_overlap_xy(ci, cj, gap=BODY_CLEARANCE)
+                if ox > 0 and oy > 0:
+                    move_a, move_b = _body_move_sets(id_i, id_j)
+                    _push_apart(move_a, move_b, ci, cj, ox, oy, _move_ids)
+                    any_moved = True
+                    continue
+
+                # ── 2. Soft: routing padding between unrelated clusters ────
+                pair = frozenset({id_i, id_j})
+                if pair in bonded:
                     continue
 
                 cluster_i = _cluster_member_ids(id_i, support_of, hosts_supports)
@@ -929,41 +1253,11 @@ def _resolve_overlaps(
                 if cluster_i & cluster_j:
                     continue
 
-                xi = ci["position"]["x"];  yi = ci["position"]["y"]
-                wi = ci["bounding_box"]["width"];  hi = _eff_h(ci)
-                xj = cj["position"]["x"];  yj = cj["position"]["y"]
-                wj = cj["bounding_box"]["width"];  hj = _eff_h(cj)
-
-                # Expanded rects
-                ax1, ay1 = xi - COMP_PADDING,        yi - COMP_PADDING
-                ax2, ay2 = xi + wi + COMP_PADDING,   yi + hi + COMP_PADDING
-                bx1, by1 = xj - COMP_PADDING,        yj - COMP_PADDING
-                bx2, by2 = xj + wj + COMP_PADDING,   yj + hj + COMP_PADDING
-
-                ox = min(ax2, bx2) - max(ax1, bx1)
-                oy = min(ay2, by2) - max(ay1, by1)
-
+                ox, oy = _body_overlap_xy(ci, cj, gap=COMP_PADDING * 2)
                 if ox <= 0 or oy <= 0:
-                    continue   # already clear
+                    continue
 
-                # Push clusters in the direction of smaller overlap
-                if ox <= oy:
-                    half = ox / 2 + 1
-                    if (xi + wi / 2) <= (xj + wj / 2):
-                        _move_ids(cluster_i, -half, 0)
-                        _move_ids(cluster_j, half, 0)
-                    else:
-                        _move_ids(cluster_i, half, 0)
-                        _move_ids(cluster_j, -half, 0)
-                else:
-                    half = oy / 2 + 1
-                    if (yi + hi / 2) <= (yj + hj / 2):
-                        _move_ids(cluster_i, 0, -half)
-                        _move_ids(cluster_j, 0, half)
-                    else:
-                        _move_ids(cluster_i, 0, half)
-                        _move_ids(cluster_j, 0, -half)
-
+                _push_apart(cluster_i, cluster_j, ci, cj, ox, oy, _move_ids)
                 any_moved = True
 
         if not any_moved:
