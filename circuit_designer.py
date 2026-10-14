@@ -75,7 +75,7 @@ The JSON must match this structure exactly:
       "value": "10k",
       "footprint": "0402",
       "position": {"x": 200, "y": 150},
-      "bounding_box": {"width": 60, "height": 30},
+      "bounding_box": {"width": 60, "height": 45},
       "supports": {"component_id": "U1", "pin_number": 3},
       "pins": [
         {"number": 1, "name": "A", "direction": "passive", "side": "left", "offset": 0.5},
@@ -120,7 +120,7 @@ The JSON must match this structure exactly:
 - pin.direction must be one of: "input", "output", "bidirectional", "passive",
   "power_in", "power_out", "open_collector", "no_connect"
 - Default bounding_box sizes:
-    resistor/capacitor/diode: {"width": 70, "height": 36}
+    resistor/capacitor/diode/ferrite/inductor (2-pin): {"width": 70, "height": 45}
     DIP IC (≤16 pins): {"width": 120, "height": <pin_count * 12>}
     DIP IC (>16 pins): {"width": 140, "height": <pin_count * 12>}
     QFP/QFN IC: {"width": 160, "height": 160}
@@ -243,26 +243,26 @@ def design_step(
         {"role": "user", "content": _build_turn_message(user_prompt, existing_circuit)}
     )
 
-    last_exc: Exception | None = None
-    for attempt in range(3):
-        try:
-            with client.messages.stream(
-                model=model or MODEL,
-                max_tokens=MAX_TOKENS,
-                system=system,
-                messages=messages,
-            ) as stream:
-                final = stream.get_final_message()
-            break
-        except Exception as e:
-            last_exc = e
-            if attempt < 2:
-                time.sleep(2 ** (attempt + 1))  # 2 s, 4 s
-    else:
+    def _stream_once(msgs: list[dict]):
+        last_exc: Exception | None = None
+        for attempt in range(3):
+            try:
+                with client.messages.stream(
+                    model=model or MODEL,
+                    max_tokens=MAX_TOKENS,
+                    system=system,
+                    messages=msgs,
+                ) as stream:
+                    return stream.get_final_message()
+            except Exception as e:
+                last_exc = e
+                if attempt < 2:
+                    time.sleep(2 ** (attempt + 1))  # 2 s, 4 s
         raise last_exc
 
-    raw_text = "".join(b.text for b in final.content if b.type == "text")
-    if on_usage:
+    def _record_usage(final) -> None:
+        if not on_usage:
+            return
         u = final.usage
         on_usage(
             u.input_tokens,
@@ -271,7 +271,48 @@ def design_step(
             getattr(u, "cache_creation_input_tokens", 0) or 0,
         )
 
-    circuit_dict, context_md, recreate_md = _parse_response(raw_text)
+    final = _stream_once(messages)
+    _record_usage(final)
+    raw_text = "".join(b.text for b in final.content if b.type == "text")
+    stop_reason = getattr(final, "stop_reason", None)
+
+    try:
+        circuit_dict, context_md, recreate_md = _parse_response(raw_text)
+    except ValueError as first_err:
+        # If output hit the token cap mid-JSON, ask Claude to continue once.
+        if stop_reason == "max_tokens":
+            cont_messages = [dict(m) for m in messages]
+            cont_messages.append({"role": "assistant", "content": raw_text})
+            cont_messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Your previous response was truncated mid-output. Continue "
+                        "EXACTLY from where you left off — emit only the remaining "
+                        "characters, with no preamble and no repetition of prior text."
+                    ),
+                }
+            )
+            cont = _stream_once(cont_messages)
+            _record_usage(cont)
+            raw_text += "".join(b.text for b in cont.content if b.type == "text")
+            stop_reason = getattr(cont, "stop_reason", None)
+            try:
+                circuit_dict, context_md, recreate_md = _parse_response(raw_text)
+            except ValueError as e:
+                _save_failed_response(project_name, raw_text, stop_reason)
+                raise ValueError(
+                    f"Claude's response was truncated (hit max_tokens={MAX_TOKENS}) "
+                    f"and could not be parsed even after one continuation. "
+                    f"Try a simpler prompt or a model with a larger output limit. "
+                    f"Detail: {e}"
+                ) from e
+        else:
+            _save_failed_response(project_name, raw_text, stop_reason)
+            raise ValueError(
+                f"{first_err} (stop_reason={stop_reason!r}). "
+                f"Raw response saved to projects/{project_name}/last_claude_response.txt"
+            ) from first_err
 
     history.append({"role": "user", "content": user_prompt.strip()})
     history.append({"role": "assistant", "content": context_md or "(circuit updated)"})
@@ -334,6 +375,19 @@ def _build_reference_block(
     return "# Project reference material\n\n" + "\n\n".join(parts)
 
 
+def _save_failed_response(
+    project_name: str, raw_text: str, stop_reason: str | None
+) -> None:
+    """Best-effort dump of an unparseable Claude reply for debugging."""
+    try:
+        path = Path("projects") / project_name / "last_claude_response.txt"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        header = f"stop_reason={stop_reason!r} length={len(raw_text)}\n\n"
+        path.write_text(header + raw_text, encoding="utf-8")
+    except OSError:
+        pass
+
+
 def _parse_response(raw_text: str) -> tuple[dict, str, str]:
     """
     Split on ---MARKDOWN--- delimiter.
@@ -345,22 +399,26 @@ def _parse_response(raw_text: str) -> tuple[dict, str, str]:
     markdown_part = parts[1].strip() if len(parts) > 1 else ""
 
     # Strip markdown code fences if Claude wrapped the JSON (e.g. ```json ... ```)
-    json_part = re.sub(r"^```[a-zA-Z]*\n?", "", json_part).rstrip("`").strip()
+    json_part = re.sub(r"^```[a-zA-Z]*\n?", "", json_part)
+    json_part = re.sub(r"\n?```\s*$", "", json_part).strip()
 
-    # Extract outermost {...} using a bracket counter
+    errors: list[str] = []
     try:
         circuit_dict = _extract_json(json_part)
-    except ValueError:
+    except ValueError as e1:
+        errors.append(str(e1))
         # If delimiter was missing, try extracting JSON from the full raw response
         try:
             circuit_dict = _extract_json(raw_text)
             markdown_part = raw_text[raw_text.rfind("}") + 1:].strip()
-        except ValueError:
+        except ValueError as e2:
+            errors.append(str(e2))
             preview = raw_text[:400].replace("\n", " ")
+            detail = " | ".join(errors)
             raise ValueError(
-                f"Could not parse JSON from Claude's response. "
+                f"Could not parse JSON from Claude's response. {detail}. "
                 f"First 400 chars: {preview}"
-            )
+            ) from e2
 
     # Split markdown into context and recreate sections
     context_md = markdown_part
@@ -377,6 +435,15 @@ def _parse_response(raw_text: str) -> tuple[dict, str, str]:
         context_md = context_md[len(context_marker):].strip()
 
     return circuit_dict, context_md, recreate_md
+
+
+def _loads_json(json_str: str) -> dict:
+    """Parse JSON, tolerating common LLM trailing-comma mistakes."""
+    try:
+        return json.loads(json_str)
+    except json.JSONDecodeError:
+        repaired = re.sub(r",(\s*[}\]])", r"\1", json_str)
+        return json.loads(repaired)
 
 
 def _extract_json(text: str) -> dict:
@@ -411,8 +478,14 @@ def _extract_json(text: str) -> dict:
             if depth == 0:
                 json_str = text[start:i + 1]
                 try:
-                    return json.loads(json_str)
+                    return _loads_json(json_str)
                 except json.JSONDecodeError as e:
-                    raise ValueError(f"JSON parse error: {e}\n\nRaw JSON:\n{json_str[:500]}")
+                    raise ValueError(
+                        f"JSON parse error: {e}. "
+                        f"Around: {json_str[max(0, e.pos - 40): e.pos + 40]!r}"
+                    ) from e
 
-    raise ValueError("Unmatched braces — could not extract JSON from response.")
+    raise ValueError(
+        f"Unmatched braces - response likely truncated "
+        f"(opened at index {start}, depth still {depth}, length {len(text)})."
+    )

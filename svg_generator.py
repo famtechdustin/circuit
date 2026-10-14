@@ -34,7 +34,8 @@ WIRE_SPACING = 12   # px to shift mid-bend when a conflict is detected
 SEG_TOL = 3.0       # px tolerance for "same axis" overlap check
 LANE_STEP = 14      # px per lane index for the dedicated breakout
 MAX_LANES = 6       # cap: lane distance cycles after this many pins (max extra = 84 px)
-MIN_COMP_H = 90     # minimum rendered component height (3 text zones)
+MIN_COMP_H = 90          # minimum height for multi-pin / IC bodies (3 text zones)
+MIN_COMP_H_COMMON = 45   # half of MIN_COMP_H — enough for 2-pin series parts
 # Clearance added around each component body when checking for overlaps.
 # Must cover pin stubs (PIN_STUB) + max lane exit (MAX_LANES * LANE_STEP) + routing room.
 COMP_PADDING = PIN_STUB + MAX_LANES * LANE_STEP + 20   # ≈ 118 px
@@ -58,7 +59,12 @@ _GND_STROKES = {
     "AGND": "#6e6e6e",
     "ISO_GND": "#999999",
 }
-_PASSIVE_TYPE_TOKENS = ("resistor", "capacitor", "cap", "bypass")
+# One-in / one-out series parts — layout stacks these beside host pins.
+_PASSIVE_TYPE_TOKENS = (
+    "resistor", "capacitor", "cap", "bypass",
+    "inductor", "coil", "ferrite", "bead",
+    "diode", "led", "schottky", "zener", "tvs",
+)
 _OPPOSITE_SIDE = {"left": "right", "right": "left", "top": "bottom", "bottom": "top"}
 
 # Voltage tokens: "3V3", "3.3V", "12V", optional leading digits in names like "MCU_5V"
@@ -160,14 +166,21 @@ def _representative_pin(connections: list, pin_counts: dict[str, int]) -> int:
     return min(fallback) if fallback else 1
 
 
-def _eff_h(comp: dict) -> float:
-    """Effective component height — enforces MIN_COMP_H regardless of JSON value."""
-    return max(float(comp["bounding_box"]["height"]), MIN_COMP_H)
-
-
 def _is_passive_type(comp: dict) -> bool:
     t = (comp.get("type") or "").lower()
     return any(tok in t for tok in _PASSIVE_TYPE_TOKENS)
+
+
+def _is_common_part(comp: dict) -> bool:
+    """2-pin series/common parts: one in, one out — render at half IC height."""
+    pins = comp.get("pins") or []
+    return len(pins) <= 2 and _is_passive_type(comp)
+
+
+def _eff_h(comp: dict) -> float:
+    """Effective component height — floor differs for common 2-pin vs multi-pin."""
+    floor = MIN_COMP_H_COMMON if _is_common_part(comp) else MIN_COMP_H
+    return max(float(comp["bounding_box"]["height"]), floor)
 
 
 def _is_multi_pin_host(comp: dict) -> bool:
@@ -1301,6 +1314,7 @@ def _draw_component(dwg: svgwrite.Drawing, group, comp: dict) -> None:
     name      = comp.get("name", "") or comp.get("type", "")
     value     = comp.get("value", "")
     comp_type = comp.get("type", "").lower()
+    compact   = _is_common_part(comp)
 
     # ── Body ──────────────────────────────────────────────────────────────
     group.add(dwg.rect(
@@ -1313,13 +1327,17 @@ def _draw_component(dwg: svgwrite.Drawing, group, comp: dict) -> None:
     cx = x + w / 2          # horizontal centre of box
 
     # ── Zone layout (3 equal horizontal bands) ────────────────────────────
+    # Compact 2-pin parts use smaller type so half-height boxes still fit.
     zone = h / 3
+    label_fs = 9 if compact else LABEL_FONT
+    name_fs = 8 if compact else FONT_SIZE
+    value_fs = 7 if compact else FONT_SIZE - 1
 
     # Zone 1 — Ref Des (top band, centred)
     group.add(dwg.text(
         cid,
         insert=(cx, y + zone * 0.55),
-        font_size=LABEL_FONT,
+        font_size=label_fs,
         font_family="monospace",
         font_weight="bold",
         fill="#222",
@@ -1331,26 +1349,32 @@ def _draw_component(dwg: svgwrite.Drawing, group, comp: dict) -> None:
     _draw_comp_symbol(dwg, group, comp_type, cx, y + zone * 1.5, w, zone)
 
     # Zone 3 — Name then value (bottom band, centred)
-    line_h = FONT_SIZE + 2
-    n_lines = 2 if value else 1
-    y_start = y + zone * 2 + (zone - n_lines * line_h) / 2 + FONT_SIZE
+    # Compact: prefer value alone when both exist (value is the useful label).
+    if compact and value:
+        bottom_lines = [value]
+        bottom_sizes = [value_fs]
+        bottom_styles = ["italic"]
+        bottom_fills = ["#666"]
+    else:
+        bottom_lines = [name] + ([value] if value else [])
+        bottom_sizes = [name_fs] + ([value_fs] if value else [])
+        bottom_styles = ["normal"] + (["italic"] if value else [])
+        bottom_fills = ["#444"] + (["#666"] if value else [])
 
-    group.add(dwg.text(
-        name,
-        insert=(cx, y_start),
-        font_size=FONT_SIZE,
-        font_family="monospace",
-        fill="#444",
-        text_anchor="middle",
-    ))
-    if value:
+    line_h = (name_fs if compact else FONT_SIZE) + (1 if compact else 2)
+    n_lines = len(bottom_lines)
+    y_start = y + zone * 2 + (zone - n_lines * line_h) / 2 + name_fs
+
+    for i, (text, fs, style, fill) in enumerate(
+        zip(bottom_lines, bottom_sizes, bottom_styles, bottom_fills)
+    ):
         group.add(dwg.text(
-            value,
-            insert=(cx, y_start + line_h),
-            font_size=FONT_SIZE - 1,
+            text,
+            insert=(cx, y_start + i * line_h),
+            font_size=fs,
             font_family="monospace",
-            font_style="italic",
-            fill="#666",
+            font_style=style,
+            fill=fill,
             text_anchor="middle",
         ))
 
