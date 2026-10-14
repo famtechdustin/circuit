@@ -78,10 +78,15 @@ def _layout_pins(comp: dict) -> tuple[int, int, list[dict]]:
         side_pins.sort(key=lambda p: float(p.get("offset", 0.5)))
 
     box = comp.get("bounding_box", {})
+    common = svg_generator._is_common_part(comp)
+    fet = bool(svg_generator._transistor_kind(comp.get("type", "")))
+    # Compact defaults for standard glyphs; ICs keep roomier boxes.
+    min_w = 3 if common else (5 if fet else 4)
+    min_h = 2 if common else (5 if fet else 2)
     w = max(round(float(box.get("width", 60)) / PX_PER_GRID),
-            len(by_side["top"]) + 1, len(by_side["bottom"]) + 1, 4)
+            len(by_side["top"]) + 1, len(by_side["bottom"]) + 1, min_w)
     h = max(round(float(box.get("height", 40)) / PX_PER_GRID),
-            len(by_side["left"]) + 1, len(by_side["right"]) + 1, 2)
+            len(by_side["left"]) + 1, len(by_side["right"]) + 1, min_h)
 
     names_seen: dict[str, int] = {}
     for p in pins:
@@ -127,12 +132,200 @@ def _sub(parent: ET.Element, tag: str, **attrs) -> ET.Element:
     return ET.SubElement(parent, tag, {k.rstrip("_"): str(v) for k, v in attrs.items()})
 
 
-def _add_symbol(symbols: ET.Element, name: str, w: int, h: int, pins: list[dict]) -> None:
-    sym = _sub(symbols, "symbol", name=name)
+def _sym_wire(sym: ET.Element, x1: float, y1: float, x2: float, y2: float,
+              width: str = "0.254") -> None:
+    """Symbol graphic wire in grid steps (EAGLE y-up)."""
+    _sub(sym, "wire",
+         x1=_mm(x1), y1=_mm(y1), x2=_mm(x2), y2=_mm(y2),
+         width=width, layer="94")
+
+
+def _sym_body_rect(sym: ET.Element, w: int, h: int) -> None:
     corners = [(0, 0), (w, 0), (w, -h), (0, -h)]
     for (x1, y1), (x2, y2) in zip(corners, corners[1:] + corners[:1]):
-        _sub(sym, "wire", x1=_mm(x1), y1=_mm(y1), x2=_mm(x2), y2=_mm(y2),
-             width="0.254", layer="94")
+        _sym_wire(sym, x1, y1, x2, y2)
+
+
+def _pin_axis_y(pins: list[dict], w: int, h: int) -> float:
+    """Preferred horizontal-symbol centreline (EAGLE y-up) from L/R pins."""
+    ys = [-float(p["tip"][1]) for p in pins if p.get("side") in {"left", "right"}]
+    return sum(ys) / len(ys) if ys else -h / 2
+
+
+def _draw_eagle_resistor(sym: ET.Element, w: int, h: int, pins: list[dict]) -> None:
+    """ANSI zigzag between left and right body edges."""
+    cy = _pin_axis_y(pins, w, h)
+    body = max(w * 0.65, 2.0)
+    x0 = (w - body) / 2
+    x1 = x0 + body
+    amp = min(max(h * 0.32, 0.6), 1.4)
+    _sym_wire(sym, 0, cy, x0, cy)
+    _sym_wire(sym, x1, cy, w, cy)
+    n = 6
+    pts = [(x0, cy)]
+    for i in range(1, n):
+        pts.append((x0 + body * i / n, cy + (amp if i % 2 else -amp)))
+    pts.append((x1, cy))
+    for (ax, ay), (bx, by) in zip(pts, pts[1:]):
+        _sym_wire(sym, ax, ay, bx, by)
+
+
+def _draw_eagle_capacitor(sym: ET.Element, w: int, h: int, pins: list[dict]) -> None:
+    """Two parallel plates (vertical for left–right pins)."""
+    cy = _pin_axis_y(pins, w, h)
+    cx = w / 2
+    gap = min(max(w * 0.12, 0.35), 0.7)
+    hh = min(max(h * 0.35, 0.8), 1.6)
+    _sym_wire(sym, 0, cy, cx - gap, cy)
+    _sym_wire(sym, cx + gap, cy, w, cy)
+    _sym_wire(sym, cx - gap, cy - hh, cx - gap, cy + hh, width="0.4064")
+    _sym_wire(sym, cx + gap, cy - hh, cx + gap, cy + hh, width="0.4064")
+
+
+def _draw_eagle_inductor(sym: ET.Element, w: int, h: int, pins: list[dict]) -> None:
+    """Three humps approximated with short segments."""
+    cy = _pin_axis_y(pins, w, h)
+    body = max(w * 0.7, 2.2)
+    x0 = (w - body) / 2
+    x1 = x0 + body
+    amp = min(max(h * 0.28, 0.5), 1.2)
+    _sym_wire(sym, 0, cy, x0, cy)
+    _sym_wire(sym, x1, cy, w, cy)
+    # 3 semicircle-ish peaks via 4-point polylines
+    seg = body / 3
+    for i in range(3):
+        a = x0 + i * seg
+        m = a + seg / 2
+        b = a + seg
+        _sym_wire(sym, a, cy, m, cy + amp)
+        _sym_wire(sym, m, cy + amp, b, cy)
+
+
+def _draw_eagle_diode(sym: ET.Element, w: int, h: int, pins: list[dict],
+                      led: bool = False) -> None:
+    """Triangle + cathode bar, anode left → cathode right."""
+    cy = _pin_axis_y(pins, w, h)
+    cx = w / 2
+    half = min(max(h * 0.35, 0.7), 1.5)
+    tip = cx + min(w * 0.18, 0.9)
+    base = cx - min(w * 0.22, 1.1)
+    _sym_wire(sym, 0, cy, base, cy)
+    _sym_wire(sym, tip, cy, w, cy)
+    _sym_wire(sym, base, cy - half, base, cy + half)
+    _sym_wire(sym, base, cy - half, tip, cy)
+    _sym_wire(sym, base, cy + half, tip, cy)
+    _sym_wire(sym, tip, cy - half, tip, cy + half, width="0.4064")
+    if led:
+        # Emission arrows (up-right from body)
+        for dy in (0.15, 0.55):
+            ax, ay = tip + 0.15, cy + half * 0.2 + dy
+            bx, by = tip + 0.7, cy + half * 0.2 + dy + 0.45
+            _sym_wire(sym, ax, ay, bx, by)
+            _sym_wire(sym, bx, by, bx - 0.25, by - 0.05)
+            _sym_wire(sym, bx, by, bx - 0.05, by - 0.25)
+
+
+def _draw_eagle_transistor(sym: ET.Element, w: int, h: int, kind: str) -> None:
+    """
+    Discrete FET/BJT in EAGLE coords (y-up).
+    Gate/base left, drain/collector top, source/emitter bottom.
+    """
+    cx, cy = w / 2, -h / 2
+    s = min(w, h) * 0.38
+    channel_x = cx - s * 0.05
+    gate_x = cx - s * 0.55
+    right_x = cx + s * 0.45
+    top_y = cy + s * 0.85
+    bot_y = cy - s * 0.85
+
+    if kind in {"nmos", "pmos"}:
+        _sym_wire(sym, 0, cy, gate_x, cy)
+        _sym_wire(sym, gate_x, cy - s * 0.55, gate_x, cy + s * 0.55)
+        for y0, y1 in (
+            (cy - s * 0.55, cy - s * 0.22),
+            (cy - s * 0.12, cy + s * 0.12),
+            (cy + s * 0.22, cy + s * 0.55),
+        ):
+            _sym_wire(sym, channel_x, y0, channel_x, y1, width="0.4064")
+        # Drain up, source down
+        _sym_wire(sym, channel_x, cy + s * 0.55, right_x, cy + s * 0.55)
+        _sym_wire(sym, right_x, cy + s * 0.55, right_x, top_y)
+        _sym_wire(sym, channel_x, cy - s * 0.55, right_x, cy - s * 0.55)
+        _sym_wire(sym, right_x, cy - s * 0.55, right_x, bot_y)
+        # Source arrow
+        if kind == "nmos":
+            _sym_wire(sym, right_x, cy - s * 0.55, channel_x + 0.05, cy - s * 0.55)
+            _sym_wire(sym, channel_x + 0.05, cy - s * 0.55,
+                      channel_x + 0.35, cy - s * 0.55 + 0.25)
+            _sym_wire(sym, channel_x + 0.05, cy - s * 0.55,
+                      channel_x + 0.35, cy - s * 0.55 - 0.25)
+        else:
+            _sym_wire(sym, channel_x, cy - s * 0.55, right_x - 0.05, cy - s * 0.55)
+            _sym_wire(sym, right_x - 0.05, cy - s * 0.55,
+                      right_x - 0.35, cy - s * 0.55 + 0.25)
+            _sym_wire(sym, right_x - 0.05, cy - s * 0.55,
+                      right_x - 0.35, cy - s * 0.55 - 0.25)
+        # Body diode stub
+        mid = right_x + s * 0.25
+        _sym_wire(sym, right_x, cy + s * 0.55, mid, cy + s * 0.55)
+        _sym_wire(sym, mid, cy + s * 0.55, mid, cy - s * 0.55)
+        _sym_wire(sym, mid, cy - s * 0.55, right_x, cy - s * 0.55)
+        if kind == "nmos":
+            _sym_wire(sym, mid - 0.2, cy - 0.15, mid + 0.2, cy - 0.15)
+            _sym_wire(sym, mid - 0.2, cy - 0.15, mid, cy + 0.2)
+            _sym_wire(sym, mid + 0.2, cy - 0.15, mid, cy + 0.2)
+            _sym_wire(sym, mid - 0.2, cy + 0.2, mid + 0.2, cy + 0.2, width="0.4064")
+        else:
+            _sym_wire(sym, mid - 0.2, cy + 0.15, mid + 0.2, cy + 0.15)
+            _sym_wire(sym, mid - 0.2, cy + 0.15, mid, cy - 0.2)
+            _sym_wire(sym, mid + 0.2, cy + 0.15, mid, cy - 0.2)
+            _sym_wire(sym, mid - 0.2, cy - 0.2, mid + 0.2, cy - 0.2, width="0.4064")
+    else:
+        bar_x = cx - s * 0.15
+        _sym_wire(sym, bar_x, cy - s * 0.55, bar_x, cy + s * 0.55, width="0.508")
+        _sym_wire(sym, 0, cy, bar_x, cy)
+        _sym_wire(sym, bar_x, cy + s * 0.28, right_x, top_y)
+        _sym_wire(sym, bar_x, cy - s * 0.28, right_x, bot_y)
+        # Emitter arrow
+        if kind == "npn":
+            _sym_wire(sym, bar_x + 0.15, cy - s * 0.2, right_x, bot_y)
+            _sym_wire(sym, right_x, bot_y, right_x - 0.35, bot_y + 0.35)
+            _sym_wire(sym, right_x, bot_y, right_x - 0.45, bot_y + 0.1)
+        else:
+            _sym_wire(sym, right_x, bot_y, bar_x + 0.15, cy - s * 0.2)
+            _sym_wire(sym, bar_x + 0.15, cy - s * 0.2,
+                      bar_x + 0.5, cy - s * 0.2 - 0.3)
+            _sym_wire(sym, bar_x + 0.15, cy - s * 0.2,
+                      bar_x + 0.55, cy - s * 0.05)
+
+
+def _add_symbol(
+    symbols: ET.Element, name: str, w: int, h: int, pins: list[dict],
+    comp_type: str = "",
+) -> None:
+    """
+    Build an EAGLE symbol. Common passives/FETs get standard glyphs so DipTrace
+    import matches the SVG schematic; everything else stays a pin-box.
+    """
+    sym = _sub(symbols, "symbol", name=name)
+    t = (comp_type or "").lower()
+    kind = svg_generator._transistor_kind(t)
+
+    if "resistor" in t:
+        _draw_eagle_resistor(sym, w, h, pins)
+    elif "capacitor" in t or t in {"cap", "bypass"}:
+        _draw_eagle_capacitor(sym, w, h, pins)
+    elif "inductor" in t or "coil" in t or "ferrite" in t:
+        _draw_eagle_inductor(sym, w, h, pins)
+    elif "led" in t:
+        _draw_eagle_diode(sym, w, h, pins, led=True)
+    elif any(x in t for x in ("diode", "schottky", "zener", "tvs")) and len(pins) <= 2:
+        _draw_eagle_diode(sym, w, h, pins)
+    elif kind and len(pins) <= 4:
+        _draw_eagle_transistor(sym, w, h, kind)
+    else:
+        _sym_body_rect(sym, w, h)
+
     _sub(sym, "text", x="0", y=_mm(0.5), size="1.778", layer="95").text = ">NAME"
     _sub(sym, "text", x="0", y=_mm(-h - 1.2), size="1.778", layer="96").text = ">VALUE"
 
@@ -705,6 +898,7 @@ def generate_eagle_sch(circuit: dict, bom_rows: list[dict] | None = None) -> str
     attached as an attribute, so DipTrace can match it to your pattern library.
     """
     components = copy.deepcopy(circuit.get("components", []))
+    svg_generator._normalize_common_bodies(components)
     nets = circuit.get("nets", [])
     power_rails = set(circuit.get("power_rails", []) or [])
     bonded = svg_generator.place_support_parts(components, nets, power_rails)
@@ -751,7 +945,7 @@ def generate_eagle_sch(circuit: dict, bom_rows: list[dict] | None = None) -> str
         row = bom.get(cid.upper(), {})
 
         dev_name = f"{_ident(comp.get('name') or comp.get('type'), 'PART')}_{part}"
-        _add_symbol(symbols, dev_name, w, h, pins)
+        _add_symbol(symbols, dev_name, w, h, pins, comp_type=str(comp.get("type") or ""))
 
         pkg_name = _ident(row.get("pattern") or comp.get("footprint"), f"PKG_{part}", upper=False)
         pads = tuple(p["pad"] for p in pins)
