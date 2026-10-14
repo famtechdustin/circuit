@@ -10,6 +10,7 @@ Or via Docker:
 
 import asyncio
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -56,6 +57,7 @@ class NewProjectRequest(BaseModel):
 class PromptRequest(BaseModel):
     project_name: str
     prompt: str
+    model: str | None = None
 
 
 class RegenSvgRequest(BaseModel):
@@ -78,6 +80,7 @@ class PromptResponse(BaseModel):
     circuit_context: str        # updated circuit_context.md content
     message: str                # human-readable summary
     revision: int = 0
+    replacements: list[dict] = []   # parts swapped out by a "replace X with Y" prompt
 
 
 class StatusResponse(BaseModel):
@@ -97,6 +100,15 @@ class StatusResponse(BaseModel):
 async def index(request: Request):
     """Serve the single-page UI."""
     return templates.TemplateResponse("index.html", {"request": request})
+
+
+@app.get("/models")
+async def list_models():
+    """Return the Claude models the UI can choose from."""
+    return {
+        "default": circuit_designer.MODEL,
+        "models": [{"id": k, "label": v} for k, v in circuit_designer.MODELS.items()],
+    }
 
 
 @app.get("/projects", response_model=list[str])
@@ -147,7 +159,22 @@ async def process_prompt(req: PromptRequest):
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
+    if req.model and req.model not in circuit_designer.MODELS:
+        raise HTTPException(status_code=400, detail=f"Unknown model '{req.model}'.")
+
     existing_circuit = project_manager.read_circuit_json(project)
+
+    # Swap parts before loading files so the new part's datasheet/symbol are sent
+    replacements = await _apply_part_replacements(project, req.prompt)
+    prompt = req.prompt
+    if replacements:
+        prompt += "\n\n" + "\n".join(
+            f"[PART_REPLACEMENT] {r['old']} has been replaced by {r['new']}"
+            + (f" ({', '.join(r['refdes'])})" if r["refdes"] else "")
+            + f". Update every component that used {r['old']} to {r['new']}, using the "
+            f"{r['new']} datasheet/KiCad pins. Its design-intent notes carry over."
+            for r in replacements
+        )
 
     # Load KiCad symbol data for all uploaded .kicad_sym files
     kicad_data: dict[str, list] = {}
@@ -165,12 +192,13 @@ async def process_prompt(req: PromptRequest):
     try:
         circuit_dict, context_md, recreate_md = circuit_designer.design_step(
             project_name=req.project_name,
-            user_prompt=req.prompt,
+            user_prompt=prompt,
             datasheet_texts=datasheet_texts,
             kicad_symbols=kicad_data,
             existing_circuit=existing_circuit,
             design_intent=_design_intent(project),
             on_usage=lambda i, o: project_manager.add_token_usage(project, i, o),
+            model=req.model,
         )
     except EnvironmentError as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -180,6 +208,7 @@ async def process_prompt(req: PromptRequest):
             missing_parts=[],
             circuit_context=project_manager.read_context_md(project),
             message=f"Failed to parse Claude's response: {e}",
+            replacements=replacements,
         )
     except Exception as e:
         return PromptResponse(
@@ -187,6 +216,7 @@ async def process_prompt(req: PromptRequest):
             missing_parts=[],
             circuit_context=project_manager.read_context_md(project),
             message=f"Claude API error: {e}",
+            replacements=replacements,
         )
 
     # Check if Claude flagged missing datasheets
@@ -200,6 +230,7 @@ async def process_prompt(req: PromptRequest):
                 f"Claude needs datasheets for: {', '.join(missing)}. "
                 f"Add the PDF(s) to projects/{req.project_name}/datasheets/ and retry."
             ),
+            replacements=replacements,
         )
 
     # Commit the design to disk
@@ -224,6 +255,7 @@ async def process_prompt(req: PromptRequest):
         circuit_context=context_md or project_manager.read_context_md(project),
         message=f"Circuit updated (revision {revision}).",
         revision=revision,
+        replacements=replacements,
     )
 
 
@@ -457,6 +489,114 @@ def _design_intent(project: project_manager.Project) -> dict | None:
             for mpn, desc in saved.get("parts", {}).items()
         ],
     }
+
+
+# "replace|swap [out] [the] <old> [up to 2 words / (note)] with|by|for [a|an|the] <new>"
+_REPLACE_TMPL = (
+    r"\b(?:replace|swap(?:\s+out)?)\s+(?:the\s+)?(?<![\w-]){old}(?![\w-])"
+    r"(?:\s+\([^)]*\))?(?:\s+[A-Za-z]+){{0,2}}?"
+    r"\s+(?:with|by|for)\s+(?:an?\s+|the\s+)?([A-Za-z0-9][\w\-./#+]*)"
+)
+
+
+def _find_part_replacements(prompt: str, aliases: dict[str, str]) -> list[tuple[str, str]]:
+    """
+    Find "replace <old> with <new>" requests in a prompt.
+    aliases maps an upper-cased MPN/RefDes/datasheet name to the listed MPN it refers to.
+    Returns [(old_mpn, new_mpn)]; <new> must look like a part number (letters + digits).
+    """
+    found: dict[str, tuple[str, str]] = {}
+    for alias in sorted(aliases, key=len, reverse=True):
+        old = aliases[alias]
+        if old.upper() in found:
+            continue
+        m = re.search(_REPLACE_TMPL.format(old=re.escape(alias)), prompt, re.IGNORECASE)
+        if not m:
+            continue
+        new = m.group(1).rstrip(".,;:!?)")
+        if (len(new) >= 3 and re.search(r"[A-Za-z]", new) and re.search(r"\d", new)
+                and new.upper() != old.upper()):
+            found[old.upper()] = (old, new)
+    return list(found.values())
+
+
+def _delete_part_files(directory: Path, ext: str, part: str) -> None:
+    if not directory.exists():
+        return
+    stems = {part.upper(), part_finder.safe_filename(part).upper()}
+    for p in directory.iterdir():
+        if p.suffix.lower() == ext and p.stem.upper() in stems:
+            p.unlink()
+
+
+async def _apply_part_replacements(project: project_manager.Project, prompt: str) -> list[dict]:
+    """
+    Handle "replace <old> with <new>" in a prompt: delete the old part's datasheet and
+    KiCad symbol, fetch the new part's, and rename the part in the BOM report and part
+    descriptions so its RefDes and notes carry over to every later prompt.
+    """
+    report = project_manager.read_bom_report(project)
+    descs = project_manager.read_part_descriptions(project)
+    rows = report.get("rows", []) if report else []
+
+    aliases: dict[str, str] = {}
+    for stem in project_manager.list_datasheets(project):
+        aliases[stem.upper()] = stem
+    for mpn in (descs or {}).get("parts", {}):
+        aliases[mpn.upper()] = mpn
+    for row in rows:
+        if row.get("generic"):
+            continue
+        aliases[row["mpn"].upper()] = row["mpn"]
+        for ref in row.get("refdes", []):
+            aliases[ref.upper()] = row["mpn"]
+
+    pairs = _find_part_replacements(prompt, aliases)
+    if not pairs:
+        return []
+
+    for old, _new in pairs:
+        _delete_part_files(project.datasheets_dir, ".pdf", old)
+        _delete_part_files(project.symbols_dir, ".kicad_sym", old)
+    fetched = {r["part"]: r for r in await _fetch_parts(project, [n for _, n in pairs])}
+
+    results = []
+    for old, new in pairs:
+        fresh = {k: v for k, v in fetched[new].items() if k != "part"}
+        refdes: list[str] = []
+
+        old_row = next((r for r in rows if r["mpn"].upper() == old.upper()), None)
+        if old_row:
+            refdes = list(old_row.get("refdes", []))
+            existing = next((r for r in rows if r["mpn"].upper() == new.upper()), None)
+            if existing:
+                existing["refdes"] += [r for r in refdes if r not in existing["refdes"]]
+                existing["qty"] = existing.get("qty", 0) + old_row.get("qty", 0)
+                existing.update(fresh)
+                rows.remove(old_row)
+            else:
+                old_row.update(fresh, mpn=new, manufacturer="", replaces=old)
+
+        if descs and descs.get("parts"):
+            parts = descs["parts"]
+            old_key = next((k for k in parts if k.upper() == old.upper()), None)
+            if old_key:
+                new_key = next((k for k in parts if k.upper() == new.upper()), None)
+                if new_key:
+                    note = parts.pop(old_key)
+                    parts[new_key] = parts[new_key] or note
+                else:
+                    descs["parts"] = {(new if k == old_key else k): v for k, v in parts.items()}
+
+        results.append({"old": old, "new": new, "refdes": refdes,
+                        "datasheet": fresh["datasheet"], "symbol": fresh["symbol"]})
+
+    if report:
+        report["summary"] = _summarize(rows)
+        project_manager.write_bom_report(project, report)
+    if descs:
+        project_manager.write_part_descriptions(project, descs)
+    return results
 
 
 @app.get("/part-descriptions/{project_name}")

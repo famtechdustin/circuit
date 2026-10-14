@@ -325,6 +325,21 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
   font-size: 14px;
 }
 
+.prompt-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.prompt-actions select {
+  padding: 4px 6px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 12px;
+  font-family: var(--font);
+  background: #f8fafc;
+}
+
 /* ------------------------------------------------------------------ */
 /* Right panel (SVG)                                                    */
 /* ------------------------------------------------------------------ */

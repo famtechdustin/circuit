@@ -20,7 +20,14 @@ from typing import Callable
 
 import anthropic
 
-MODEL = "claude-sonnet-4-6"
+MODEL = "claude-sonnet-5-5"
+# Models offered in the UI dropdown: id -> display label.
+# Every model listed must support at least MAX_TOKENS output tokens.
+MODELS = {
+    "claude-sonnet-5-5": "Claude Sonnet 5.5",
+    "claude-opus-5-5": "Claude Opus 5.5",
+    "claude-haiku-5-5": "Claude Haiku 5.5",
+}
 MAX_TOKENS = 50000
 HISTORY_WINDOW = 10  # keep last N turns to stay within context budget
 
@@ -168,11 +175,13 @@ def design_step(
     existing_circuit: dict | None,
     design_intent: dict | None = None,
     on_usage: Callable[[int, int], None] | None = None,
+    model: str | None = None,
 ) -> tuple[dict, str, str]:
     """
     Run one design turn for the given project.
 
     design_intent: {"overview": str, "parts": [{"mpn", "refdes", "description"}]}
+    model: one of MODELS; defaults to MODEL.
     on_usage: called with (input_tokens, output_tokens) once Claude responds,
               before parsing, so usage is recorded even if parsing fails.
 
@@ -201,7 +210,7 @@ def design_step(
     for attempt in range(3):
         try:
             with client.messages.stream(
-                model=MODEL,
+                model=model or MODEL,
                 max_tokens=MAX_TOKENS,
                 system=SYSTEM_PROMPT,
                 messages=history,

@@ -100,7 +100,10 @@
         placeholder="Describe your circuit… (Shift+Enter for new line, Enter to send)"
         disabled
       ></textarea>
-      <button id="send-btn" onclick="sendPrompt()" disabled>Send</button>
+      <div class="prompt-actions">
+        <select id="model-select" title="Claude model for this request"></select>
+        <button id="send-btn" onclick="sendPrompt()" disabled>Send</button>
+      </div>
     </div>
   </main>
 
@@ -150,6 +153,7 @@ let svgPanStartY = 0;
 // ---------------------------------------------------------------------------
 document.addEventListener('DOMContentLoaded', () => {
   loadProjects();
+  loadModels();
 
   const input = document.getElementById('prompt-input');
   input.addEventListener('keydown', (e) => {
@@ -564,6 +568,23 @@ async function clearHistory() {
 // ---------------------------------------------------------------------------
 // Prompt / chat
 // ---------------------------------------------------------------------------
+async function loadModels() {
+  const res = await fetch('/models');
+  if (!res.ok) return;
+  const data = await res.json();
+  const select = document.getElementById('model-select');
+  select.innerHTML = '';
+  data.models.forEach(m => {
+    const opt = document.createElement('option');
+    opt.value = m.id;
+    opt.textContent = m.label;
+    select.appendChild(opt);
+  });
+  const saved = localStorage.getItem('model');
+  select.value = data.models.some(m => m.id === saved) ? saved : data.default;
+  select.onchange = () => localStorage.setItem('model', select.value);
+}
+
 async function sendPrompt() {
   if (!currentProject) return;
   const input = document.getElementById('prompt-input');
@@ -583,10 +604,26 @@ async function sendPrompt() {
     const res = await fetch('/prompt', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({project_name: currentProject, prompt}),
+      body: JSON.stringify({
+        project_name: currentProject,
+        prompt,
+        model: document.getElementById('model-select').value || null,
+      }),
     });
     const data = await res.json();
     removeThinking();
+
+    if (data.replacements?.length) {
+      const lines = data.replacements.map(r => {
+        const refs = r.refdes.length ? ` (${r.refdes.join(', ')})` : '';
+        const missing = [r.datasheet !== 'found' && 'datasheet', r.symbol !== 'found' && 'KiCad symbol']
+          .filter(Boolean);
+        return `Replaced ${r.old} with ${r.new}${refs}; notes carried over.`
+          + (missing.length ? ` No ${missing.join(' or ')} found for ${r.new}.` : '');
+      });
+      addChatMessage('assistant', lines.join('\n'), 'info');
+      if (bomReport) await loadBomReport();
+    }
 
     if (data.status === 'ok') {
       addChatMessage('assistant', data.message + (data.circuit_context ? `\n\n${data.circuit_context}` : ''));
@@ -597,7 +634,7 @@ async function sendPrompt() {
       showMissingAlert(data.missing_parts);
       await refreshStatus();
     } else {
-      addChatMessage('assistant', 'Error: ' + data.message, 'error');
+      addChatMessage('assistant', 'Error: ' + (data.message || data.detail), 'error');
       await refreshStatus();
     }
   } catch (err) {

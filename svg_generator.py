@@ -524,7 +524,8 @@ def _draw_component(dwg: svgwrite.Drawing, group, comp: dict) -> None:
     # ── Body ──────────────────────────────────────────────────────────────
     group.add(dwg.rect(
         insert=(x, y), size=(w, h),
-        fill=COMP_FILL, stroke=COMP_STROKE, stroke_width=COMP_STROKE_W,
+        fill=COMP_FILL, fill_opacity=0.85,
+        stroke=COMP_STROKE, stroke_width=COMP_STROKE_W,
         rx=3, ry=3,
     ))
 
