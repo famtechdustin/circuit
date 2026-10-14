@@ -86,6 +86,7 @@ class StatusResponse(BaseModel):
     kicad_symbols: list[str]
     has_circuit: bool
     revision: int
+    token_usage: dict
 
 
 # ---------------------------------------------------------------------------
@@ -131,6 +132,7 @@ async def get_status(project_name: str):
         kicad_symbols=project_manager.list_kicad_symbols(project),
         has_circuit=circuit is not None,
         revision=revision,
+        token_usage=project_manager.read_token_usage(project),
     )
 
 
@@ -168,6 +170,7 @@ async def process_prompt(req: PromptRequest):
             kicad_symbols=kicad_data,
             existing_circuit=existing_circuit,
             design_intent=_design_intent(project),
+            on_usage=lambda i, o: project_manager.add_token_usage(project, i, o),
         )
     except EnvironmentError as e:
         raise HTTPException(status_code=500, detail=str(e))

@@ -10,6 +10,7 @@ Each project lives at projects/<name>/ and contains:
   schematic.svg     — latest generated SVG schematic
   bom_report.json   — results of the last BOM import (per-part fetch status)
   part_descriptions.json — user's description of the board and what each main part does
+  token_usage.json  — cumulative Claude API token usage for the project
 """
 
 import json
@@ -31,6 +32,7 @@ class Project:
     svg_path: Path
     bom_report_path: Path
     part_descriptions_path: Path
+    token_usage_path: Path
 
 
 def _make_project(name: str) -> Project:
@@ -46,6 +48,7 @@ def _make_project(name: str) -> Project:
         svg_path=root / "schematic.svg",
         bom_report_path=root / "bom_report.json",
         part_descriptions_path=root / "part_descriptions.json",
+        token_usage_path=root / "token_usage.json",
     )
 
 
@@ -167,3 +170,25 @@ def read_part_descriptions(project: Project) -> dict | None:
 
 def write_part_descriptions(project: Project, data: dict) -> None:
     project.part_descriptions_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def read_token_usage(project: Project) -> dict:
+    """Return {"input_tokens", "output_tokens", "total_tokens", "requests"}, zeroed if none."""
+    usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "requests": 0}
+    if project.token_usage_path.exists():
+        try:
+            usage.update(json.loads(project.token_usage_path.read_text(encoding="utf-8")))
+        except (json.JSONDecodeError, OSError):
+            pass
+    return usage
+
+
+def add_token_usage(project: Project, input_tokens: int, output_tokens: int) -> dict:
+    """Add one request's usage to the project's running total and return the new total."""
+    usage = read_token_usage(project)
+    usage["input_tokens"] += input_tokens
+    usage["output_tokens"] += output_tokens
+    usage["total_tokens"] = usage["input_tokens"] + usage["output_tokens"]
+    usage["requests"] += 1
+    project.token_usage_path.write_text(json.dumps(usage, indent=2), encoding="utf-8")
+    return usage

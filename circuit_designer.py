@@ -16,6 +16,7 @@ import os
 import time
 import re
 from pathlib import Path
+from typing import Callable
 
 import anthropic
 
@@ -166,11 +167,14 @@ def design_step(
     kicad_symbols: dict[str, list],
     existing_circuit: dict | None,
     design_intent: dict | None = None,
+    on_usage: Callable[[int, int], None] | None = None,
 ) -> tuple[dict, str, str]:
     """
     Run one design turn for the given project.
 
     design_intent: {"overview": str, "parts": [{"mpn", "refdes", "description"}]}
+    on_usage: called with (input_tokens, output_tokens) once Claude responds,
+              before parsing, so usage is recorded even if parsing fails.
 
     Returns (circuit_dict, circuit_context_md, recreate_prompt_md).
     Raises ValueError on parse failure.
@@ -202,7 +206,7 @@ def design_step(
                 system=SYSTEM_PROMPT,
                 messages=history,
             ) as stream:
-                raw_text = stream.get_final_text()
+                final = stream.get_final_message()
             break
         except Exception as e:
             last_exc = e
@@ -210,6 +214,10 @@ def design_step(
                 time.sleep(2 ** (attempt + 1))  # 2 s, 4 s
     else:
         raise last_exc
+
+    raw_text = "".join(b.text for b in final.content if b.type == "text")
+    if on_usage:
+        on_usage(final.usage.input_tokens, final.usage.output_tokens)
 
     history.append({"role": "assistant", "content": raw_text})
 

@@ -11,6 +11,7 @@
 <header>
   <h1>Circuit Design Generator</h1>
   <span id="project-badge" class="badge"></span>
+  <span id="token-badge" class="badge" style="display:none"></span>
 </header>
 
 <div class="layout">
@@ -222,8 +223,18 @@ async function refreshStatus() {
   if (!res.ok) return;
   const data = await res.json();
 
+  renderTokenBadge(data.token_usage);
   renderFileList('datasheet-list', data.datasheets, '.pdf', `/files/datasheet/${currentProject}`);
   renderFileList('step-list', data.kicad_symbols, '.kicad_sym', `/files/symbol/${currentProject}`);
+}
+
+function renderTokenBadge(usage) {
+  const badge = document.getElementById('token-badge');
+  if (!usage) { badge.style.display = 'none'; return; }
+  const fmt = n => n.toLocaleString();
+  badge.textContent = `${fmt(usage.total_tokens)} tokens`;
+  badge.title = `Input: ${fmt(usage.input_tokens)}\nOutput: ${fmt(usage.output_tokens)}\nRequests: ${fmt(usage.requests)}`;
+  badge.style.display = '';
 }
 
 function renderFileList(listId, items, ext, deleteEndpoint) {
@@ -587,6 +598,7 @@ async function sendPrompt() {
       await refreshStatus();
     } else {
       addChatMessage('assistant', 'Error: ' + data.message, 'error');
+      await refreshStatus();
     }
   } catch (err) {
     removeThinking();
